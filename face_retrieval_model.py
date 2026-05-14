@@ -245,15 +245,12 @@ class FaceRetrievalModel(nn.Module):
 # ============================================================
 
 def freeze_backbone(model: FaceRetrievalModel) -> None:
-    """
-    Stage 1:
-    Freeze the pretrained face model and train only the classifier head.
-    """
     for param in model.backbone.parameters():
         param.requires_grad = False
 
-    for param in model.classifier.parameters():
-        param.requires_grad = True
+    if model.classifier is not None:
+        for param in model.classifier.parameters():
+            param.requires_grad = True
 
 
 def unfreeze_last_backbone_layers(model: FaceRetrievalModel) -> None:
@@ -277,8 +274,9 @@ def unfreeze_last_backbone_layers(model: FaceRetrievalModel) -> None:
         if any(keyword in name for keyword in trainable_keywords):
             param.requires_grad = True
 
-    for param in model.classifier.parameters():
-        param.requires_grad = True
+    if model.classifier is not None:
+        for param in model.classifier.parameters():
+            param.requires_grad = True
 
 
 def unfreeze_full_backbone(model: FaceRetrievalModel) -> None:
