@@ -306,7 +306,7 @@ def create_optimizer(
     classifier_params = [
         p for p in model.classifier.parameters()
         if p.requires_grad
-    ]
+    ] if model.classifier is not None else []
 
     param_groups = []
 
