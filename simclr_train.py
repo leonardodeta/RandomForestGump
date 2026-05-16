@@ -82,6 +82,10 @@ def main():
         help="Quante epoch tenere il backbone congelato (stage 1). "
              "Poi si sblocca parzialmente (stage 2). 0 = salta stage 1."
     )
+    parser.add_argument(
+        "--resume", default=None,
+        help="Path a un checkpoint .pt da cui riprendere i pesi del backbone."
+    )
     args = parser.parse_args()
 
     device = get_device()
@@ -108,6 +112,14 @@ def main():
     model = FaceRetrievalModel(num_classes=None, pretrained="vggface2").to(device)
     head = ProjectionHead(input_dim=512, hidden_dim=512, output_dim=128).to(device)
     criterion = TripletLoss(margin=args.margin)
+
+    # --------------------------------------------------------
+    # Resume da checkpoint esistente
+    # --------------------------------------------------------
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        print(f"[simclr_train] Pesi caricati da: {args.resume}")
 
     # --------------------------------------------------------
     # Stage 1: backbone congelato, allena solo il projection head
