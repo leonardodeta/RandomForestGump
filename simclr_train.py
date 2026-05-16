@@ -1,7 +1,7 @@
 """
 simclr_train.py
 ---------------
-Fine-tuning self-supervised di InceptionResnetV1 con SimCLR (NT-Xent loss).
+Fine-tuning self-supervised di InceptionResnetV1 con Triplet Loss (hard negative mining).
 
 Non richiede label di identita': impara embedding continui da sole immagini.
 
@@ -48,7 +48,7 @@ from face_retrieval_model import (
     get_device,
     TrainingConfig,
 )
-from loss_functions import NTXentLoss
+from loss_functions import TripletLoss
 from train_finetune import PairDataset, train_simclr_epoch
 
 
@@ -72,8 +72,8 @@ def main():
     parser.add_argument("--backbone-lr",    type=float, default=1e-5,
                         help="Learning rate del backbone (fine-tuning)")
     parser.add_argument("--weight-decay",   type=float, default=1e-4)
-    parser.add_argument("--temperature",    type=float, default=0.07,
-                        help="Temperatura NT-Xent. Con batch piccoli usare 0.1-0.2.")
+    parser.add_argument("--margin",          type=float, default=0.3,
+                        help="Margine Triplet Loss (default 0.3). Aumentare se gli embedding collassano.")
     parser.add_argument("--workers",        type=int,   default=4)
     parser.add_argument("--image-size",     type=int,   default=160)
     parser.add_argument("--log-every",      type=int,   default=50)
@@ -107,7 +107,7 @@ def main():
     # --------------------------------------------------------
     model = FaceRetrievalModel(num_classes=None, pretrained="vggface2").to(device)
     head = ProjectionHead(input_dim=512, hidden_dim=512, output_dim=128).to(device)
-    criterion = NTXentLoss(temperature=args.temperature)
+    criterion = TripletLoss(margin=args.margin)
 
     # --------------------------------------------------------
     # Stage 1: backbone congelato, allena solo il projection head
