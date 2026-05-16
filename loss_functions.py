@@ -635,3 +635,62 @@ class NTXentLoss(nn.Module):
 
         loss = F.cross_entropy(sim, labels)
         return {"loss": loss, "logits": None}
+
+
+# ============================================================
+# Triplet Loss con hard negative mining online
+# ============================================================
+
+class TripletLoss(nn.Module):
+    """
+    Triplet Loss con hard negative mining online.
+
+    Per ogni immagine nel batch:
+        - Anchor:   embedding vista A
+        - Positivo: embedding vista B (stessa immagine, augmentazione diversa)
+        - Negativo: l'embedding PIU' SIMILE all'anchor tra tutti gli altri
+                    del batch (hard negative)
+
+    Loss = mean( max(0, d(anchor, pos) - d(anchor, neg) + margin) )
+
+    Usa distanza coseno (1 - cosine_similarity) coerentemente
+    con il retrieval in search_system.py.
+
+    Args:
+        margin: separazione minima tra positivo e negativo (tipico 0.2-0.5)
+    """
+
+    def __init__(self, margin: float = 0.3):
+        super().__init__()
+        self.margin = margin
+
+    def forward(
+        self,
+        z_a: torch.Tensor,  # (N, D) embedding vista A
+        z_b: torch.Tensor,  # (N, D) embedding vista B
+    ) -> Dict[str, torch.Tensor]:
+
+        N = z_a.size(0)
+        device = z_a.device
+
+        z_a = F.normalize(z_a, p=2, dim=1)
+        z_b = F.normalize(z_b, p=2, dim=1)
+
+        # Distanza coseno: 1 - similarita'
+        pos_dist = 1.0 - (z_a * z_b).sum(dim=1)  # (N,)
+
+        # Similarita' tra ogni anchor (z_a) e tutti i z_b nel batch
+        sim_matrix = z_a @ z_b.T  # (N, N)
+
+        # Escludi il positivo (diagonale)
+        mask = torch.eye(N, dtype=torch.bool, device=device)
+        sim_matrix = sim_matrix.masked_fill(mask, float("-inf"))
+
+        # Hard negative: z_b piu' simile all'anchor (escluso il suo positivo)
+        hardest_neg_sim, _ = sim_matrix.max(dim=1)   # (N,)
+        neg_dist = 1.0 - hardest_neg_sim              # (N,)
+
+        # Triplet loss
+        loss = F.relu(pos_dist - neg_dist + self.margin).mean()
+
+        return {"loss": loss, "logits": None}
