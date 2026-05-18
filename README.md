@@ -12,8 +12,9 @@ python crop_faces.py --input /percorso_cartella --output /percorso_cartella
 
 per trainare (per mac):
 cd ~/ML_project
+
 python -u simclr_train.py \
-  --data-folder ~/ffhq \
+  --data-folder ~/percorso_cartella_foto(deve essere cartella piatta) \
   --resume primo checkpoint per sequenziale (opzionale, se non c'è rimuovere).pt \
   --output nome_checkpoint_output.pt \
   --epochs 10 \
@@ -21,8 +22,11 @@ python -u simclr_train.py \
   --margin 0.3 (si può cambiare, ma tendenzialmente va bene) \
   --freeze-stage-epochs (scrivere 0 se sequenziale, 3 se è il primo) \
   --workers 8 \
-  --log-every 10
-tail -f training_triplet.log
+  --log-every 1
+  
+tail -f training_triplet.log 
+
+
 
 per la competition (per mac):
 Bisogna cambiare il checkpoint con il nome del checkpoint che usiamo
