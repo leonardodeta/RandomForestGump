@@ -588,3 +588,137 @@ def fine_tune_face_model(
         print(f"\nLoaded best model with retrieval score: {best_score:.2f}")
 
     return model
+
+
+# ============================================================
+# SimCLR: dataset a coppie e training epoch
+# ============================================================
+
+import os
+from typing import Tuple
+from PIL import Image
+from torchvision import transforms
+from torch.utils.data import Dataset
+
+
+def _simclr_augmentation(image_size: int = 160) -> transforms.Compose:
+    """
+    Augmentazioni aggressive per SimCLR su volti.
+    Forzano il modello a imparare feature invarianti all'aspetto visivo
+    mantenendo l'identita'.
+    """
+    return transforms.Compose([
+        transforms.RandomResizedCrop(
+            size=image_size,
+            scale=(0.6, 1.0),
+            ratio=(0.9, 1.1),
+        ),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(
+            brightness=0.4,
+            contrast=0.4,
+            saturation=0.4,
+            hue=0.1,
+        ),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.GaussianBlur(
+            kernel_size=int(0.1 * image_size) | 1,
+            sigma=(0.1, 2.0),
+        ),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                             std=[0.5, 0.5, 0.5]),
+    ])
+
+
+class PairDataset(Dataset):
+    """
+    Carica immagini da una cartella (piatta o ImageFolder).
+    Per ogni immagine restituisce due augmentazioni diverse: (view_a, view_b).
+    Le label non vengono usate.
+
+    Compatibile con CelebA (cartella piatta) e qualsiasi struttura ImageFolder.
+    """
+
+    VALID_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+    def __init__(self, root: str, image_size: int = 160):
+        self.augment = _simclr_augmentation(image_size)
+        self.paths = self._collect_paths(root)
+        if len(self.paths) == 0:
+            raise ValueError(f"Nessuna immagine trovata in: {root}")
+        print(f"[PairDataset] {len(self.paths)} immagini caricate da: {root}")
+
+    def _collect_paths(self, root: str):
+        paths = []
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                if fn.lower().endswith(self.VALID_EXT):
+                    paths.append(os.path.join(dirpath, fn))
+        return sorted(paths)
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        img = Image.open(self.paths[idx]).convert("RGB")
+        return self.augment(img), self.augment(img)
+
+
+def train_simclr_epoch(
+    backbone: nn.Module,
+    projection_head: nn.Module,
+    loader: Iterable,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+    log_every: int = 50,
+) -> Dict[str, float]:
+    """
+    Un epoch di training SimCLR.
+
+    Args:
+        backbone:         FaceRetrievalModel (o qualsiasi modello con .encode())
+        projection_head:  ProjectionHead importato da face_retrieval_model
+        loader:           DataLoader che restituisce coppie (view_a, view_b)
+        optimizer:        ottimizzatore che copre sia backbone che head
+        criterion:        NTXentLoss da loss_functions
+        device:           device su cui girare
+        log_every:        ogni quanti step stampare il log
+
+    Returns:
+        dict con "loss" media dell'epoch
+    """
+    backbone.train()
+    projection_head.train()
+
+    total_loss = 0.0
+    total_steps = 0
+
+    for step, (view_a, view_b) in enumerate(loader, start=1):
+        view_a = view_a.to(device, non_blocking=True)
+        view_b = view_b.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # Estrai embedding dal backbone, poi proietta
+        h_a = backbone.encode(view_a, normalize=False)   # (N, 512)
+        h_b = backbone.encode(view_b, normalize=False)   # (N, 512)
+
+        z_a = projection_head(h_a)                       # (N, 128)
+        z_b = projection_head(h_b)                       # (N, 128)
+
+        loss_output = criterion(z_a, z_b)
+        loss = loss_output["loss"]
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_steps += 1
+
+        if log_every > 0 and step % log_every == 0:
+            avg = total_loss / total_steps
+            print(f"  step {step:04d} | simclr loss {avg:.4f}")
+
+    return {"loss": total_loss / max(total_steps, 1)}

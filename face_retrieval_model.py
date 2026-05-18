@@ -1,4 +1,4 @@
-# face_retrieval_ml.py
+# face_retrieval_model.py
 
 import copy
 from dataclasses import dataclass
@@ -145,23 +145,53 @@ def unpack_batch(
 # Model: pretrained face-recognition backbone + classifier head
 # ============================================================
 
-class FaceRetrievalModel(nn.Module):
+# ============================================================
+# Projection head (usato solo durante SimCLR training)
+# ============================================================
+
+class ProjectionHead(nn.Module):
     """
-    Pretrained face-recognition feature extractor.
-
-    During training:
-        image -> backbone -> embedding -> classifier -> identity logits
-
-    During retrieval:
-        image -> backbone -> normalized embedding
-
-    The classifier is only used during training.
-    The embedding is what we use for cosine similarity retrieval.
+    MLP 512 -> 512 -> 128 per SimCLR.
+    Viene usato SOLO durante il training, non a inference time.
+    A inference si usano gli embedding a 512-d del backbone direttamente.
     """
 
     def __init__(
         self,
-        num_classes: int,
+        input_dim: int = 512,
+        hidden_dim: int = 512,
+        output_dim: int = 128,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class FaceRetrievalModel(nn.Module):
+    """
+    Pretrained face-recognition feature extractor.
+
+    Modalita' SimCLR (num_classes=None, default):
+        image -> backbone -> normalized embedding
+        Il ProjectionHead viene creato esternamente in train_finetune.py.
+
+    Modalita' classificazione (num_classes=N, opzionale):
+        image -> backbone -> embedding -> classifier -> identity logits
+        Utile solo se si hanno label di identita'.
+
+    The embedding (512-d) is what we use for cosine similarity retrieval.
+    """
+
+    def __init__(
+        self,
+        num_classes: Optional[int] = None,
         pretrained: str = "vggface2",
         dropout: float = 0.2,
     ):
@@ -174,21 +204,28 @@ class FaceRetrievalModel(nn.Module):
 
         self.embedding_dim = 512
 
-        self.classifier = nn.Sequential(
-            nn.Dropout(p=dropout),
-            nn.Linear(self.embedding_dim, num_classes),
-        )
+        # Il classifier e' opzionale: serve solo se si hanno label di identita'.
+        if num_classes is not None:
+            self.classifier: Optional[nn.Module] = nn.Sequential(
+                nn.Dropout(p=dropout),
+                nn.Linear(self.embedding_dim, num_classes),
+            )
+        else:
+            self.classifier = None
 
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         raw_embeddings = self.backbone(images)
         normalized_embeddings = F.normalize(raw_embeddings, p=2, dim=1)
-        logits = self.classifier(raw_embeddings)
 
-        return {
-            "logits": logits,
+        result: Dict[str, torch.Tensor] = {
             "embeddings": normalized_embeddings,
             "raw_embeddings": raw_embeddings,
         }
+
+        if self.classifier is not None:
+            result["logits"] = self.classifier(raw_embeddings)
+
+        return result
 
     def encode(
         self,
@@ -208,15 +245,12 @@ class FaceRetrievalModel(nn.Module):
 # ============================================================
 
 def freeze_backbone(model: FaceRetrievalModel) -> None:
-    """
-    Stage 1:
-    Freeze the pretrained face model and train only the classifier head.
-    """
     for param in model.backbone.parameters():
         param.requires_grad = False
 
-    for param in model.classifier.parameters():
-        param.requires_grad = True
+    if model.classifier is not None:
+        for param in model.classifier.parameters():
+            param.requires_grad = True
 
 
 def unfreeze_last_backbone_layers(model: FaceRetrievalModel) -> None:
@@ -240,8 +274,9 @@ def unfreeze_last_backbone_layers(model: FaceRetrievalModel) -> None:
         if any(keyword in name for keyword in trainable_keywords):
             param.requires_grad = True
 
-    for param in model.classifier.parameters():
-        param.requires_grad = True
+    if model.classifier is not None:
+        for param in model.classifier.parameters():
+            param.requires_grad = True
 
 
 def unfreeze_full_backbone(model: FaceRetrievalModel) -> None:
@@ -271,7 +306,7 @@ def create_optimizer(
     classifier_params = [
         p for p in model.classifier.parameters()
         if p.requires_grad
-    ]
+    ] if model.classifier is not None else []
 
     param_groups = []
 
@@ -834,14 +869,17 @@ def load_checkpoint(
 ) -> Tuple[FaceRetrievalModel, TrainingConfig, Optional[Dict[int, str]]]:
     checkpoint = torch.load(path, map_location=device)
 
-    config = checkpoint["config"]
+    config = checkpoint.get("config", None)
+
+    # Supporta checkpoint SimCLR (num_classes assente) e checkpoint supervisionati
+    num_classes = getattr(config, "num_classes", None) if config is not None else None
 
     model = FaceRetrievalModel(
-        num_classes=config.num_classes,
+        num_classes=num_classes,
         pretrained=None,
     )
 
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     model = model.to(device)
     model.eval()
 

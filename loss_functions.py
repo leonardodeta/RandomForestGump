@@ -1,4 +1,4 @@
-# block4_losses.py
+# loss_functions.py
 
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
@@ -530,6 +530,7 @@ def train_one_epoch_with_identity_loss(
 # Validation using the chosen loss
 # ============================================================
 
+
 @torch.no_grad()
 def evaluate_identity_loss(
     model: nn.Module,
@@ -578,3 +579,118 @@ def evaluate_identity_loss(
         result["identity_accuracy"] = total_correct / max(total_examples, 1)
 
     return result
+
+
+# ============================================================
+# NT-Xent loss (SimCLR) — non richiede label di identita'
+# ============================================================
+
+class NTXentLoss(nn.Module):
+    """
+    Normalized Temperature-scaled Cross Entropy Loss per SimCLR.
+
+    Non richiede label: impara embedding continui da coppie di viste
+    augmentate della stessa immagine.
+
+    Per un batch di N immagini si hanno 2N viste (view_a, view_b).
+    Per ogni vista v_i, la positiva e' la gemella v_j (stessa immagine),
+    le negative sono tutte le altre 2(N-1) viste nel batch.
+
+    Batch piu' grandi = piu' negativi = training piu' efficace.
+    Minimo consigliato: 128 immagini per batch.
+
+    Args:
+        temperature: tau. Tipico 0.07 (stringente) o 0.1-0.2 (con batch piccoli).
+    """
+
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(
+        self,
+        z_a: torch.Tensor,  # (N, D) proiezioni vista A
+        z_b: torch.Tensor,  # (N, D) proiezioni vista B
+    ) -> Dict[str, torch.Tensor]:
+
+        N = z_a.size(0)
+        device = z_a.device
+
+        z_a = F.normalize(z_a, p=2, dim=1)
+        z_b = F.normalize(z_b, p=2, dim=1)
+
+        # Concatena: [z_a_0 ... z_a_{N-1}, z_b_0 ... z_b_{N-1}]
+        z = torch.cat([z_a, z_b], dim=0)           # (2N, D)
+        sim = (z @ z.T) / self.temperature           # (2N, 2N)
+
+        # Escludi la diagonale (un campione con se stesso)
+        mask_self = torch.eye(2 * N, dtype=torch.bool, device=device)
+        sim.masked_fill_(mask_self, float("-inf"))
+
+        # La positiva di i in [0,N) e' i+N, e viceversa
+        labels = torch.cat([
+            torch.arange(N, 2 * N, device=device),
+            torch.arange(0, N, device=device),
+        ])
+
+        loss = F.cross_entropy(sim, labels)
+        return {"loss": loss, "logits": None}
+
+
+# ============================================================
+# Triplet Loss con hard negative mining online
+# ============================================================
+
+class TripletLoss(nn.Module):
+    """
+    Triplet Loss con hard negative mining online.
+
+    Per ogni immagine nel batch:
+        - Anchor:   embedding vista A
+        - Positivo: embedding vista B (stessa immagine, augmentazione diversa)
+        - Negativo: l'embedding PIU' SIMILE all'anchor tra tutti gli altri
+                    del batch (hard negative)
+
+    Loss = mean( max(0, d(anchor, pos) - d(anchor, neg) + margin) )
+
+    Usa distanza coseno (1 - cosine_similarity) coerentemente
+    con il retrieval in search_system.py.
+
+    Args:
+        margin: separazione minima tra positivo e negativo (tipico 0.2-0.5)
+    """
+
+    def __init__(self, margin: float = 0.3):
+        super().__init__()
+        self.margin = margin
+
+    def forward(
+        self,
+        z_a: torch.Tensor,  # (N, D) embedding vista A
+        z_b: torch.Tensor,  # (N, D) embedding vista B
+    ) -> Dict[str, torch.Tensor]:
+
+        N = z_a.size(0)
+        device = z_a.device
+
+        z_a = F.normalize(z_a, p=2, dim=1)
+        z_b = F.normalize(z_b, p=2, dim=1)
+
+        # Distanza coseno: 1 - similarita'
+        pos_dist = 1.0 - (z_a * z_b).sum(dim=1)  # (N,)
+
+        # Similarita' tra ogni anchor (z_a) e tutti i z_b nel batch
+        sim_matrix = z_a @ z_b.T  # (N, N)
+
+        # Escludi il positivo (diagonale)
+        mask = torch.eye(N, dtype=torch.bool, device=device)
+        sim_matrix = sim_matrix.masked_fill(mask, float("-inf"))
+
+        # Hard negative: z_b piu' simile all'anchor (escluso il suo positivo)
+        hardest_neg_sim, _ = sim_matrix.max(dim=1)   # (N,)
+        neg_dist = 1.0 - hardest_neg_sim              # (N,)
+
+        # Triplet loss
+        loss = F.relu(pos_dist - neg_dist + self.margin).mean()
+
+        return {"loss": loss, "logits": None}
