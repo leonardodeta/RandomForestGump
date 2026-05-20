@@ -1,0 +1,20 @@
+# Core deep-learning stack
+# Nota: facenet-pytorch 2.6.0 richiede versioni compatibili di torch/torchvision.
+# Su Azure GPU, se l'ambiente ha già CUDA configurato, verificare prima con:
+#   python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+
+torch>=2.2.0,<2.3.0
+torchvision>=0.17.0,<0.18.0
+
+# Face recognition / face detection
+facenet-pytorch==2.6.0
+
+# Image handling and numeric computation
+numpy>=1.24.0,<2.0.0
+Pillow>=10.2.0,<10.3.0
+
+# HTTP submission to local competition server
+requests>=2.0.0,<3.0.0
+
+# Progress utilities, required by facenet-pytorch
+tqdm>=4.0.0,<5.0.0
