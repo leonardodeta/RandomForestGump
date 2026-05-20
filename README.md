@@ -7,7 +7,7 @@ Facial recognition project for an Introduction to Machine Learning course. Given
 comandi da scrivere su terminale macchina virtuale
 
 crop_faces.py:
-python crop_faces.py --input /percorso_cartella --output /percorso_cartella
+python crop_faces.py --input /percorso_cartella --output /percorso_cartella_destinazione(nuova, da creare)
 
 
 per trainare (per mac):
