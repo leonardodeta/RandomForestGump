@@ -24,7 +24,7 @@ python -u simclr_train.py \
   --workers 8 \
   --log-every 1
   
-tail -f training_triplet.log 
+tail -f training_triplet.log (per vedere a che punto si è)
 
 
 
