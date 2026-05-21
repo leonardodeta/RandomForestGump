@@ -33,8 +33,10 @@ Bisogna cambiare il checkpoint con il nome del checkpoint che usiamo
 
 python run_competition.py \
     --data-folder /percorso \
-    --group-name "random_forest_group" \
+    --group-name "random_forest_gump" \
     --checkpoint simclr_checkpoint.pt \ 
     --dry-run
+
+    --submit-url http://videosim.disi.unitn.it:3001/retrieval/
 
 
