@@ -17,6 +17,11 @@ except ImportError as exc:
         "pip install facenet-pytorch"
     ) from exc
 
+try:
+    import timm
+except ImportError:
+    timm = None
+
 
 # ============================================================
 # Configuration
@@ -186,7 +191,8 @@ class FaceRetrievalModel(nn.Module):
         image -> backbone -> embedding -> classifier -> identity logits
         Utile solo se si hanno label di identita'.
 
-    The embedding (512-d) is what we use for cosine similarity retrieval.
+    arch='inception_resnet_v1' (default): InceptionResNetV1 pretrained VGGFace2, embedding 512-d.
+    arch='inception_resnet_v2': InceptionResNetV2 via timm, pretrained ImageNet, embedding 1536-d.
     """
 
     def __init__(
@@ -194,15 +200,27 @@ class FaceRetrievalModel(nn.Module):
         num_classes: Optional[int] = None,
         pretrained: str = "vggface2",
         dropout: float = 0.2,
+        arch: str = "inception_resnet_v1",
     ):
         super().__init__()
 
-        self.backbone = InceptionResnetV1(
-            pretrained=pretrained,
-            classify=False,
-        )
+        self.arch = arch
 
-        self.embedding_dim = 512
+        if arch == "inception_resnet_v2":
+            if timm is None:
+                raise ImportError("timm non installato. Esegui: pip install timm")
+            self.backbone = timm.create_model(
+                "inception_resnet_v2",
+                pretrained=True,
+                num_classes=0,  # rimuove il classifier finale, restituisce features
+            )
+            self.embedding_dim = 1536
+        else:
+            self.backbone = InceptionResnetV1(
+                pretrained=pretrained,
+                classify=False,
+            )
+            self.embedding_dim = 512
 
         # Il classifier e' opzionale: serve solo se si hanno label di identita'.
         if num_classes is not None:
@@ -244,6 +262,7 @@ class FaceRetrievalModel(nn.Module):
 # Freezing / unfreezing strategy
 # ============================================================
 
+
 def freeze_backbone(model: FaceRetrievalModel) -> None:
     for param in model.backbone.parameters():
         param.requires_grad = False
@@ -251,7 +270,6 @@ def freeze_backbone(model: FaceRetrievalModel) -> None:
     if model.classifier is not None:
         for param in model.classifier.parameters():
             param.requires_grad = True
-
 
 def unfreeze_last_backbone_layers(model: FaceRetrievalModel) -> None:
     """

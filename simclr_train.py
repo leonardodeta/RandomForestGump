@@ -86,6 +86,11 @@ def main():
         "--resume", default=None,
         help="Path a un checkpoint .pt da cui riprendere i pesi del backbone."
     )
+    parser.add_argument(
+        "--arch", default="inception_resnet_v1",
+        choices=["inception_resnet_v1", "inception_resnet_v2"],
+        help="Architettura backbone (default: inception_resnet_v1)."
+    )
     args = parser.parse_args()
 
     device = get_device()
@@ -96,7 +101,8 @@ def main():
     # --------------------------------------------------------
     # Dataset e DataLoader
     # --------------------------------------------------------
-    dataset = PairDataset(root=args.data_folder, image_size=args.image_size)
+    image_size = 299 if args.arch == "inception_resnet_v2" else args.image_size
+    dataset = PairDataset(root=args.data_folder, image_size=image_size)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -109,9 +115,16 @@ def main():
     # --------------------------------------------------------
     # Modello: backbone pretrained + projection head
     # --------------------------------------------------------
-    model = FaceRetrievalModel(num_classes=None, pretrained="vggface2").to(device)
-    head = ProjectionHead(input_dim=512, hidden_dim=512, output_dim=128).to(device)
+    embedding_dim = 1536 if args.arch == "inception_resnet_v2" else 512
+    image_size    = 299  if args.arch == "inception_resnet_v2" else args.image_size
+
+    model = FaceRetrievalModel(num_classes=None, pretrained="vggface2", arch=args.arch).to(device)
+    head = ProjectionHead(input_dim=embedding_dim, hidden_dim=embedding_dim, output_dim=128).to(device)
     criterion = TripletLoss(margin=args.margin)
+
+    print(f"[simclr_train] arch         = {args.arch}")
+    print(f"[simclr_train] embedding_dim = {embedding_dim}")
+    print(f"[simclr_train] image_size    = {image_size}")
 
     # --------------------------------------------------------
     # Resume da checkpoint esistente

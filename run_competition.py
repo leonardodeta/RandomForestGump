@@ -70,14 +70,34 @@ def main():
     # Toggle componenti (per debug, ma di default tutto on tranne QE).
     parser.add_argument("--no-tta", action="store_true")
     parser.add_argument("--no-kreciprocal", action="store_true")
-    parser.add_argument("--qe", action="store_true",
-                        help="Attiva alpha-QE (default off, va testato sul val)")
+    parser.add_argument("--qe", action="store_true", default=False,
+                        help="Attiva alpha-QE (default off).")
+    parser.add_argument("--qe-top-k", type=int, default=5,
+                        help="Numero di vicini per alpha-QE (default: 5).")
+    parser.add_argument("--qe-alpha", type=float, default=3.0,
+                        help="Peso alpha per alpha-QE (default: 3.0).")
     parser.add_argument("--no-mmr", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                         help="Non chiamare la submit URL; salva su file.")
     parser.add_argument("--checkpoint", default=None,
                         help="Path checkpoint SimCLR (opzionale). "
                              "Se non fornito usa pretrained VGGFace2.")
+    parser.add_argument("--arch", default="inception_resnet_v1",
+                        choices=["inception_resnet_v1", "inception_resnet_v2"],
+                        help="Architettura backbone (default: inception_resnet_v1).")
+    parser.add_argument("--mmr-lambda", type=float, nargs="+", default=None,
+                        help="Lambda MMR per ogni rank (10 valori). "
+                             "Es: --mmr-lambda 1.0 0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1. "
+                             "Se un solo valore, viene usato per tutti i rank. "
+                             "Se non specificato usa lo schedule decrescente [1.0, 0.9, ..., 0.5].")
+    parser.add_argument("--k1", type=int, default=20,
+                        help="k1 per k-reciprocal reranking (default: 20).")
+    parser.add_argument("--k2", type=int, default=6,
+                        help="k2 per k-reciprocal reranking (default: 6).")
+    parser.add_argument("--kr-lambda", type=float, default=0.3,
+                        help="Lambda k-reciprocal: bilancia distanza originale e reranked (default: 0.3).")
+    parser.add_argument("--mmr-pool", type=int, default=50,
+                        help="Candidati iniziali per MMR (default: 50).")
     args = parser.parse_args()
 
     device = pick_device()
@@ -86,7 +106,7 @@ def main():
     # 1) Encoder: FaceNet pretrained su VGGFace2.
     #    Se disponibile un checkpoint SimCLR, passarlo con --checkpoint.
     checkpoint = getattr(args, "checkpoint", None)
-    encoder = FaceNetEncoder(device=device, checkpoint_path=checkpoint)
+    encoder = FaceNetEncoder(device=device, checkpoint_path=checkpoint, arch=args.arch)
 
     # 2) Carica query e gallery
     query_folder = os.path.join(args.data_folder, "query")
@@ -100,8 +120,17 @@ def main():
         encoder=encoder,
         use_tta=not args.no_tta,
         use_kreciprocal=not args.no_kreciprocal,
+        k1=args.k1,
+        k2=args.k2,
+        kr_lambda=args.kr_lambda,
         use_qe=args.qe,
+        qe_top_k=args.qe_top_k,
+        qe_alpha=args.qe_alpha,
         use_mmr=not args.no_mmr,
+        mmr_initial_pool=args.mmr_pool,
+        mmr_lambda_schedule=(
+            args.mmr_lambda * (10 // len(args.mmr_lambda) + 1))[:10]
+            if args.mmr_lambda is not None else None,
         top_k_output=10,
     )
 
