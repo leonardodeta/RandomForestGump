@@ -1,189 +1,114 @@
 """
 run_ablation.py
 ---------------
-Run retrieval ablations on a local validation set.
+Esegue tutti i componenti del search system in modalita' ablation sul
+VALIDATION SET locale (quello che sta preparando il compagno).
 
-Expected structure:
+Genera la tabella che andra' nel report nella sezione "Results and Ablations":
+
+    Method                                | Top-1 | Top-5 | Top-10 | Score
+    --------------------------------------|-------|-------|--------|------
+    Baseline (cosine)                     |  ...  |  ...  |  ...   |  ...
+    + TTA                                 |  ...  |  ...  |  ...   |  ...
+    + k-reciprocal re-ranking             |  ...  |  ...  |  ...   |  ...
+    + alpha-QE                            |  ...  |  ...  |  ...   |  ...
+    + MMR diversification (full)          |  ...  |  ...  |  ...   |  ...
+
+IMPORTANTE: lo script assume un validation set strutturato cosi':
     val/
-      query/
-      gallery/
-      ground_truth.json
-
-``ground_truth.json`` format:
-    {"query_filename.jpg": ["matching_gallery_1.jpg", "matching_gallery_2.jpg"]}
-
-The metric denominator is the number of validation queries with non-empty ground
-truth, not merely the number of predictions produced by the pipeline. Missing
-predictions are therefore counted as errors instead of being silently ignored.
+      query/     <- immagini naturali
+      gallery/   <- immagini sintetiche (inclusi distrattori)
+      ground_truth.json   <- { query_filename: [lista filenames gallery con stessa identita'] }
 """
 
-from __future__ import annotations
-
-import argparse
+import os
 import json
-import shutil
-from pathlib import Path
+import argparse
 from typing import Dict, List
+
+from facenet_encoder import FaceNetEncoder
+from search_system import RetrievalSystem
+from run_competition import load_folder, pick_device
 
 
 def compute_metrics(
     predictions: Dict[str, List[str]],
     ground_truth: Dict[str, List[str]],
 ) -> Dict[str, float]:
-    """Compute Top-1, Top-5, Top-10 and weighted competition score.
-
-    Missing predictions for valid ground-truth queries are counted as wrong.
-    Extra predictions that are not present in ground truth are reported but do
-    not affect the denominator.
-    """
+    """Calcola Top-1, Top-5, Top-10 e final score (come la competizione)."""
+    n = len(predictions)
     top1 = top5 = top10 = 0
-    evaluated = 0
-    empty_ground_truth = 0
-    missing_predictions = 0
-
-    for qfn, truth_values in ground_truth.items():
-        truth = set(truth_values or [])
+    for qfn, pred in predictions.items():
+        truth = set(ground_truth.get(qfn, []))
         if not truth:
-            empty_ground_truth += 1
             continue
-
-        evaluated += 1
-        pred = predictions.get(qfn)
-        if pred is None:
-            missing_predictions += 1
-            pred = []
-
-        if pred and pred[0] in truth:
+        if pred[0] in truth:
             top1 += 1
         if any(p in truth for p in pred[:5]):
             top5 += 1
         if any(p in truth for p in pred[:10]):
             top10 += 1
-
-    if evaluated == 0:
-        raise ValueError(
-            "No valid ground-truth entries found. Check ground_truth.json and filename keys."
-        )
-
-    extra_predictions = len(set(predictions) - set(ground_truth))
-
-    top1_acc = top1 / evaluated
-    top5_acc = top5 / evaluated
-    top10_acc = top10 / evaluated
+    top1_acc = top1 / n
+    top5_acc = top5 / n
+    top10_acc = top10 / n
     score = 600 * top1_acc + 300 * top5_acc + 100 * top10_acc
-
     return {
         "top1": top1_acc,
         "top5": top5_acc,
         "top10": top10_acc,
         "score": score,
-        "evaluated": evaluated,
-        "empty_ground_truth": empty_ground_truth,
-        "missing_predictions": missing_predictions,
-        "extra_predictions": extra_predictions,
     }
 
 
 def evaluate(system, query_folder, gallery_folder, ground_truth):
-    # Heavy imports are kept inside the function so compute_metrics can be
-    # imported in lightweight tests without facenet-pytorch/MTCNN installed.
-    from run_competition import load_folder
-
     qi, qfn = load_folder(query_folder)
     gi, gfn = load_folder(gallery_folder)
     preds = system.run(qi, qfn, gi, gfn, verbose=False)
     return compute_metrics(preds, ground_truth)
 
 
-def _prepare_auto_cropped_val(val_folder: Path, output_folder: Path, image_size: int, device) -> Path:
-    from crop_faces import crop_folder
-
-    if output_folder.exists():
-        shutil.rmtree(output_folder)
-    output_folder.mkdir(parents=True, exist_ok=True)
-
-    crop_folder(val_folder / "query", output_folder / "query", image_size=image_size, device=device)
-    crop_folder(val_folder / "gallery", output_folder / "gallery", image_size=image_size, device=device)
-    shutil.copy2(val_folder / "ground_truth.json", output_folder / "ground_truth.json")
-    return output_folder
-
-
 def main():
-    # Heavy imports are deliberately local. This makes the metric function usable
-    # in unit tests even on machines without the full face-recognition stack.
-    from facenet_encoder import FaceNetEncoder
-    from run_competition import pick_device
-    from search_system import RetrievalSystem
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--val-folder", required=True,
-                        help="Validation folder with query/, gallery/, ground_truth.json")
+                        help="Cartella di validazione con query/, gallery/, ground_truth.json")
     parser.add_argument("--checkpoint", default=None,
-                        help="Optional fine-tuned checkpoint. If absent, uses pretrained weights.")
-    parser.add_argument("--arch", default="inception_resnet_v1",
-                        choices=["inception_resnet_v1", "inception_resnet_v2"],
-                        help="Backbone for pretrained mode. Checkpoint metadata overrides this.")
-    parser.add_argument("--auto-crop", action="store_true",
-                        help="Crop validation query/gallery before running ablations")
-    parser.add_argument("--crop-image-size", type=int, default=None,
-                        help="Crop size. Defaults to encoder input size.")
-    parser.add_argument("--crop-output-folder", default=".cropped_ablation",
-                        help="Where automatic validation crops are written")
+                        help="Path checkpoint SimCLR (opzionale). "
+                             "Se non fornito usa pretrained VGGFace2.")
     args = parser.parse_args()
 
     device = pick_device()
     print(f"[ablation] device = {device}")
 
-    encoder = FaceNetEncoder(
-        device=device,
-        checkpoint_path=args.checkpoint,
-        arch=args.arch,
-    )
-
-    val_folder = Path(args.val_folder)
-    if args.auto_crop:
-        crop_size = args.crop_image_size or encoder.image_size
-        val_folder = _prepare_auto_cropped_val(
-            val_folder=val_folder,
-            output_folder=Path(args.crop_output_folder),
-            image_size=crop_size,
-            device=device,
-        )
-
-    with open(val_folder / "ground_truth.json", encoding="utf-8") as f:
+    with open(os.path.join(args.val_folder, "ground_truth.json")) as f:
         ground_truth = json.load(f)
+    query_folder = os.path.join(args.val_folder, "query")
+    gallery_folder = os.path.join(args.val_folder, "gallery")
 
-    query_folder = val_folder / "query"
-    gallery_folder = val_folder / "gallery"
+    # NB: lo stesso encoder viene riusato in tutte le configurazioni:
+    # l'embedding e' lo stesso, cambia solo cosa fa il search system dopo.
+    checkpoint = getattr(args, "checkpoint", None)
+    encoder = FaceNetEncoder(device=device, checkpoint_path=checkpoint)
 
     configs = [
-        ("Baseline cosine", dict(
+        ("Baseline (cosine)", dict(
             use_tta=False, use_kreciprocal=False, use_qe=False, use_mmr=False)),
-        ("+ TTA", dict(
-            use_tta=True, use_kreciprocal=False, use_qe=False, use_mmr=False)),
-        ("+ k-reciprocal", dict(
-            use_tta=True, use_kreciprocal=True, use_qe=False, use_mmr=False)),
-        ("+ alpha-QE", dict(
-            use_tta=True, use_kreciprocal=True, use_qe=True, use_mmr=False)),
-        ("+ MMR diversif.", dict(
-            use_tta=True, use_kreciprocal=True, use_qe=True, use_mmr=True)),
+        ("+ TTA",             dict(
+            use_tta=True,  use_kreciprocal=False, use_qe=False, use_mmr=False)),
+        ("+ k-reciprocal",    dict(
+            use_tta=True,  use_kreciprocal=True,  use_qe=False, use_mmr=False)),
+        ("+ alpha-QE",        dict(
+            use_tta=True,  use_kreciprocal=True,  use_qe=True,  use_mmr=False)),
+        ("+ MMR diversif.",   dict(
+            use_tta=True,  use_kreciprocal=True,  use_qe=True,  use_mmr=True)),
     ]
 
-    print(
-        f"\n{'Method':<28} {'Top-1':>7} {'Top-5':>7} {'Top-10':>7} "
-        f"{'Score':>8} {'Eval':>6} {'Miss':>6} {'Extra':>6}"
-    )
-    print("-" * 92)
+    print(f"\n{'Method':<28} {'Top-1':>7} {'Top-5':>7} {'Top-10':>7} {'Score':>8}")
+    print("-" * 64)
     for name, cfg in configs:
         system = RetrievalSystem(encoder=encoder, **cfg)
-        metrics = evaluate(system, query_folder, gallery_folder, ground_truth)
-        print(
-            f"{name:<28} "
-            f"{metrics['top1']:>7.3f} {metrics['top5']:>7.3f} "
-            f"{metrics['top10']:>7.3f} {metrics['score']:>8.1f} "
-            f"{metrics['evaluated']:>6d} {metrics['missing_predictions']:>6d} "
-            f"{metrics['extra_predictions']:>6d}"
-        )
+        m = evaluate(system, query_folder, gallery_folder, ground_truth)
+        print(f"{name:<28} {m['top1']:>7.3f} {m['top5']:>7.3f} "
+              f"{m['top10']:>7.3f} {m['score']:>8.1f}")
 
 
 if __name__ == "__main__":
