@@ -675,21 +675,20 @@ def train_simclr_epoch(
     log_every: int = 50,
 ) -> Dict[str, float]:
     """
-    Un epoch di training SimCLR.
+    One epoch of self-supervised two-view training.
 
-    Args:
-        backbone:         FaceRetrievalModel (o qualsiasi modello con .encode())
-        projection_head:  ProjectionHead importato da face_retrieval_model
-        loader:           DataLoader che restituisce coppie (view_a, view_b)
-        optimizer:        ottimizzatore che copre sia backbone che head
-        criterion:        NTXentLoss da loss_functions
-        device:           device su cui girare
-        log_every:        ogni quanti step stampare il log
-
-    Returns:
-        dict con "loss" media dell'epoch
+    The criterion can be NTXentLoss or TripletLoss. When the backbone is fully
+    frozen we keep it in eval mode, otherwise BatchNorm running statistics would
+    still change even though all parameters have requires_grad=False.
     """
-    backbone.train()
+    backbone_has_trainable_params = any(
+        p.requires_grad for p in backbone.parameters()
+    )
+    if backbone_has_trainable_params:
+        backbone.train()
+    else:
+        backbone.eval()
+
     projection_head.train()
 
     total_loss = 0.0
@@ -701,12 +700,11 @@ def train_simclr_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Estrai embedding dal backbone, poi proietta
-        h_a = backbone.encode(view_a, normalize=False)   # (N, 512)
-        h_b = backbone.encode(view_b, normalize=False)   # (N, 512)
+        h_a = backbone.encode(view_a, normalize=False)
+        h_b = backbone.encode(view_b, normalize=False)
 
-        z_a = projection_head(h_a)                       # (N, 128)
-        z_b = projection_head(h_b)                       # (N, 128)
+        z_a = projection_head(h_a)
+        z_b = projection_head(h_b)
 
         loss_output = criterion(z_a, z_b)
         loss = loss_output["loss"]
@@ -719,6 +717,6 @@ def train_simclr_epoch(
 
         if log_every > 0 and step % log_every == 0:
             avg = total_loss / total_steps
-            print(f"  step {step:04d} | simclr loss {avg:.4f}")
+            print(f"  step {step:04d} | self-supervised loss {avg:.4f}")
 
     return {"loss": total_loss / max(total_steps, 1)}

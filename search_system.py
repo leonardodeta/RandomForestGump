@@ -43,7 +43,9 @@ class RetrievalSystem:
         qe_top_k: int = 5,
         qe_alpha: float = 3.0,
         # --- MMR diversification ---
-        use_mmr: bool = True,
+        # Disabled by default: for identity retrieval, diversity can remove
+        # correct same-identity images unless validation proves otherwise.
+        use_mmr: bool = False,
         mmr_lambda_schedule: Optional[List[float]] = None,
         mmr_initial_pool: int = 50,
         # --- output ---
@@ -133,16 +135,16 @@ class RetrievalSystem:
         score: torch.Tensor,
         gallery_feats: torch.Tensor,
     ) -> torch.Tensor:
+        k = min(self.top_k_output, score.size(1))
         if self.use_mmr:
             return mmr_rerank(
                 score, gallery_feats,
-                top_k=self.top_k_output,
+                top_k=k,
                 lambda_schedule=self.mmr_lambda_schedule,
                 initial_pool=self.mmr_initial_pool,
             )
-        else:
-            _, idx = torch.topk(score, k=self.top_k_output, dim=1)
-            return idx
+        _, idx = torch.topk(score, k=k, dim=1)
+        return idx
 
     # ------------------------------------------------------------------ #
     # API pubblica
