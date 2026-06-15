@@ -29,7 +29,8 @@ except ImportError:
 
 @dataclass
 class TrainingConfig:
-    num_classes: int
+    num_classes: Optional[int] = None
+    arch: str = "inception_resnet_v1"
     stage1_epochs: int = 5
     stage2_epochs: int = 5
     head_lr: float = 1e-3
@@ -44,7 +45,7 @@ class TrainingConfig:
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
@@ -204,15 +205,27 @@ class FaceRetrievalModel(nn.Module):
     ):
         super().__init__()
 
+        valid_architectures = {"inception_resnet_v1", "inception_resnet_v2"}
+        if arch not in valid_architectures:
+            raise ValueError(
+                f"Unsupported architecture '{arch}'. "
+                f"Choose one of: {sorted(valid_architectures)}"
+            )
+
         self.arch = arch
 
         if arch == "inception_resnet_v2":
             if timm is None:
-                raise ImportError("timm non installato. Esegui: pip install timm")
+                raise ImportError(
+                    "Missing dependency: timm. Install it with:\n"
+                    "pip install timm"
+                )
+            # timm expects a boolean for pretrained. When loading a checkpoint
+            # we pass pretrained=None so that no ImageNet weights are downloaded.
             self.backbone = timm.create_model(
                 "inception_resnet_v2",
-                pretrained=True,
-                num_classes=0,  # rimuove il classifier finale, restituisce features
+                pretrained=pretrained is not None,
+                num_classes=0,  # remove final classifier, return features
             )
             self.embedding_dim = 1536
         else:
@@ -273,29 +286,36 @@ def freeze_backbone(model: FaceRetrievalModel) -> None:
 
 def unfreeze_last_backbone_layers(model: FaceRetrievalModel) -> None:
     """
-    Stage 2:
-    Fine-tune only the last part of the backbone.
+    Stage 2 fine-tuning strategy.
 
-    This is safer than full fine-tuning when the dataset is small.
+    For the FaceNet V1 backbone we unfreeze the final FaceNet blocks.
+    For the timm Inception-ResNet-V2 backbone, layer names differ, so we
+    conservatively unfreeze the final trainable parameter tensors.
     """
     for param in model.backbone.parameters():
         param.requires_grad = False
 
-    trainable_keywords = [
-        "repeat_3",
-        "block8",
-        "last_linear",
-        "last_bn",
-    ]
+    if model.arch == "inception_resnet_v1":
+        trainable_keywords = [
+            "repeat_3",
+            "block8",
+            "last_linear",
+            "last_bn",
+        ]
 
-    for name, param in model.backbone.named_parameters():
-        if any(keyword in name for keyword in trainable_keywords):
+        for name, param in model.backbone.named_parameters():
+            if any(keyword in name for keyword in trainable_keywords):
+                param.requires_grad = True
+    else:
+        # timm model naming can change slightly across versions. Unfreezing the
+        # last tensors is safer than relying on exact block names.
+        named_params = list(model.backbone.named_parameters())
+        for _, param in named_params[-30:]:
             param.requires_grad = True
 
     if model.classifier is not None:
         for param in model.classifier.parameters():
             param.requires_grad = True
-
 
 def unfreeze_full_backbone(model: FaceRetrievalModel) -> None:
     """
@@ -340,6 +360,11 @@ def create_optimizer(
             "lr": head_lr,
         })
 
+    if not param_groups:
+        raise ValueError(
+            "No trainable parameters were found. Unfreeze the backbone or attach a classifier/head before building the optimizer."
+        )
+
     return torch.optim.AdamW(
         param_groups,
         weight_decay=weight_decay,
@@ -380,6 +405,8 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         outputs = model(images)
+        if "logits" not in outputs:
+            raise ValueError("train_one_epoch requires a model with a classifier head.")
         logits = outputs["logits"]
 
         loss = F.cross_entropy(
@@ -432,6 +459,8 @@ def evaluate_classifier(
             raise ValueError("Validation batches must contain labels.")
 
         outputs = model(images)
+        if "logits" not in outputs:
+            raise ValueError("evaluate_classifier requires a model with a classifier head.")
         logits = outputs["logits"]
 
         loss = F.cross_entropy(logits, labels)
@@ -520,36 +549,48 @@ def rank_gallery_for_queries(
     chunk_size: int = 512,
 ) -> torch.Tensor:
     """
-    Computes cosine similarity through matrix multiplication.
+    Computes cosine-similarity rankings for query/gallery embeddings.
 
-    Assumes both query_embeddings and gallery_embeddings are already L2-normalized.
+    The function defensively normalizes embeddings and clamps ``top_k`` to the
+    number of available gallery items, so it is safe on small validation sets.
 
     Returns:
-        topk_indices: LongTensor [num_queries, top_k]
+        LongTensor [num_queries, min(top_k, num_gallery)].
     """
-    query_embeddings = F.normalize(query_embeddings, p=2, dim=1)
-    gallery_embeddings = F.normalize(gallery_embeddings, p=2, dim=1)
+    if query_embeddings.ndim != 2 or gallery_embeddings.ndim != 2:
+        raise ValueError("query_embeddings and gallery_embeddings must be 2-D tensors")
+    if query_embeddings.size(1) != gallery_embeddings.size(1):
+        raise ValueError("query and gallery embeddings must have the same dimension")
+    if query_embeddings.size(0) == 0:
+        raise ValueError("query_embeddings is empty")
+    if gallery_embeddings.size(0) == 0:
+        raise ValueError("gallery_embeddings is empty")
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+
+    safe_top_k = min(int(top_k), gallery_embeddings.size(0))
+
+    query_embeddings = F.normalize(query_embeddings.float(), p=2, dim=1)
+    gallery_embeddings = F.normalize(gallery_embeddings.float(), p=2, dim=1)
 
     all_topk = []
 
     for start in range(0, query_embeddings.size(0), chunk_size):
         end = start + chunk_size
-
         query_chunk = query_embeddings[start:end]
         similarity = query_chunk @ gallery_embeddings.T
-
         _, topk_indices = torch.topk(
             similarity,
-            k=top_k,
+            k=safe_top_k,
             dim=1,
             largest=True,
             sorted=True,
         )
-
         all_topk.append(topk_indices.cpu())
 
     return torch.cat(all_topk, dim=0)
-
 
 def build_retrieval_dictionary(
     query_filenames: Sequence[str],
@@ -597,7 +638,9 @@ def retrieval_topk_accuracy(
     A query is correct at Top-k if at least one of the first k gallery
     images has the same identity label.
     """
-    max_k = max(ks)
+    if gallery_embeddings.size(0) == 0:
+        raise ValueError("gallery_embeddings is empty")
+    max_k = min(max(ks), gallery_embeddings.size(0))
 
     topk_indices = rank_gallery_for_queries(
         query_embeddings=query_embeddings,
@@ -611,7 +654,8 @@ def retrieval_topk_accuracy(
     metrics = {}
 
     for k in ks:
-        retrieved_labels = gallery_labels[topk_indices[:, :k]]
+        effective_k = min(k, topk_indices.size(1))
+        retrieved_labels = gallery_labels[topk_indices[:, :effective_k]]
         correct = (retrieved_labels == query_labels.unsqueeze(1)).any(dim=1)
         metrics[f"top{k}"] = correct.float().mean().item()
 
@@ -868,36 +912,66 @@ def make_test_submission_dictionary(
 def save_checkpoint(
     path: str,
     model: FaceRetrievalModel,
-    config: TrainingConfig,
+    config: Optional[TrainingConfig] = None,
     label_to_identity: Optional[Dict[int, str]] = None,
+    extra: Optional[Dict[str, object]] = None,
 ) -> None:
+    """Save a checkpoint with enough metadata to restore the right model.
+
+    Older versions of this project saved only ``model_state_dict``. That made
+    checkpoint loading ambiguous when multiple architectures were supported.
+    The checkpoint now stores the architecture explicitly.
+    """
     checkpoint = {
+        "checkpoint_version": 2,
         "model_state_dict": model.state_dict(),
+        "arch": model.arch,
+        "embedding_dim": model.embedding_dim,
+        "num_classes": getattr(config, "num_classes", None) if config is not None else None,
         "config": config,
         "label_to_identity": label_to_identity,
     }
+    if extra:
+        checkpoint.update(extra)
 
     torch.save(checkpoint, path)
     print(f"Saved checkpoint to: {path}")
 
 
+def _get_checkpoint_arch(checkpoint: Dict[str, object]) -> str:
+    config = checkpoint.get("config", None)
+    arch_from_config = getattr(config, "arch", None) if config is not None else None
+    return checkpoint.get("arch") or arch_from_config or "inception_resnet_v1"
+
+
 def load_checkpoint(
     path: str,
     device: torch.device,
-) -> Tuple[FaceRetrievalModel, TrainingConfig, Optional[Dict[int, str]]]:
+) -> Tuple[FaceRetrievalModel, Optional[TrainingConfig], Optional[Dict[int, str]]]:
     checkpoint = torch.load(path, map_location=device)
 
     config = checkpoint.get("config", None)
+    arch = _get_checkpoint_arch(checkpoint)
 
-    # Supporta checkpoint SimCLR (num_classes assente) e checkpoint supervisionati
-    num_classes = getattr(config, "num_classes", None) if config is not None else None
+    # Support both supervised and self-supervised checkpoints.
+    num_classes = checkpoint.get("num_classes", None)
+    if num_classes is None and config is not None:
+        num_classes = getattr(config, "num_classes", None)
 
     model = FaceRetrievalModel(
         num_classes=num_classes,
         pretrained=None,
+        arch=arch,
     )
 
-    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    missing, unexpected = model.load_state_dict(
+        checkpoint["model_state_dict"], strict=False
+    )
+    if missing:
+        print(f"[load_checkpoint] Missing keys while loading: {missing}")
+    if unexpected:
+        print(f"[load_checkpoint] Unexpected keys while loading: {unexpected}")
+
     model = model.to(device)
     model.eval()
 

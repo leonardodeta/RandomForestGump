@@ -1,4 +1,13 @@
-# train_finetune.py
+"""
+train_finetune.py
+-----------------
+Optional supervised fine-tuning utilities.
+
+This file is not required for the main competition baseline. It is useful only
+when identity labels are available. The final retrieval pipeline can still run
+with the pretrained FaceNet encoder without using this module.
+"""
+
 
 import copy
 from dataclasses import dataclass
@@ -44,7 +53,7 @@ class FineTuneConfig:
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
@@ -108,6 +117,12 @@ def freeze_backbone(model: nn.Module) -> None:
     for param in model.backbone.parameters():
         param.requires_grad = False
 
+    if getattr(model, "classifier", None) is None:
+        raise ValueError("Supervised fine-tuning requires model.classifier to be defined.")
+
+    if getattr(model, "classifier", None) is None:
+        raise ValueError("Supervised fine-tuning requires model.classifier to be defined.")
+
     for param in model.classifier.parameters():
         param.requires_grad = True
 
@@ -168,10 +183,13 @@ def build_optimizer(
         if p.requires_grad
     ]
 
-    classifier_params = [
-        p for p in model.classifier.parameters()
-        if p.requires_grad
-    ]
+    if getattr(model, "classifier", None) is None:
+        classifier_params = []
+    else:
+        classifier_params = [
+            p for p in model.classifier.parameters()
+            if p.requires_grad
+        ]
 
     param_groups = []
 
@@ -186,6 +204,11 @@ def build_optimizer(
             "params": classifier_params,
             "lr": classifier_lr,
         })
+
+    if not param_groups:
+        raise ValueError(
+            "No trainable parameters found. Check the freezing strategy and classifier head."
+        )
 
     return torch.optim.AdamW(
         param_groups,
@@ -218,6 +241,8 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         outputs = model(images)
+        if "logits" not in outputs:
+            raise ValueError("train_one_epoch requires a model with a classifier head.")
         logits = outputs["logits"]
 
         loss = F.cross_entropy(
@@ -274,6 +299,8 @@ def evaluate_classifier(
         images, labels = unpack_batch(batch, device)
 
         outputs = model(images)
+        if "logits" not in outputs:
+            raise ValueError("evaluate_classifier requires a model with a classifier head.")
         logits = outputs["logits"]
 
         loss = F.cross_entropy(logits, labels)
@@ -350,9 +377,13 @@ def compute_topk_retrieval_metrics(
 
     similarity_matrix = query_embeddings @ gallery_embeddings.T
 
+    if gallery_embeddings.size(0) == 0:
+        raise ValueError("gallery_embeddings is empty")
+    safe_top_k = min(int(top_k), gallery_embeddings.size(0))
+
     _, topk_indices = torch.topk(
         similarity_matrix,
-        k=top_k,
+        k=safe_top_k,
         dim=1,
         largest=True,
         sorted=True,
@@ -481,9 +512,13 @@ def fine_tune_face_model(
 
             torch.save(
                 {
+                    "checkpoint_version": 2,
                     "model_state_dict": best_state,
                     "config": config,
+                    "arch": getattr(model, "arch", "inception_resnet_v1"),
+                    "num_classes": config.num_classes,
                     "best_score": best_score,
+                    "training_mode": "supervised_finetune",
                 },
                 config.checkpoint_path,
             )
@@ -675,21 +710,20 @@ def train_simclr_epoch(
     log_every: int = 50,
 ) -> Dict[str, float]:
     """
-    Un epoch di training SimCLR.
+    One epoch of self-supervised two-view training.
 
-    Args:
-        backbone:         FaceRetrievalModel (o qualsiasi modello con .encode())
-        projection_head:  ProjectionHead importato da face_retrieval_model
-        loader:           DataLoader che restituisce coppie (view_a, view_b)
-        optimizer:        ottimizzatore che copre sia backbone che head
-        criterion:        NTXentLoss da loss_functions
-        device:           device su cui girare
-        log_every:        ogni quanti step stampare il log
-
-    Returns:
-        dict con "loss" media dell'epoch
+    The criterion can be NTXentLoss or TripletLoss. When the backbone is fully
+    frozen we keep it in eval mode, otherwise BatchNorm running statistics would
+    still change even though all parameters have requires_grad=False.
     """
-    backbone.train()
+    backbone_has_trainable_params = any(
+        p.requires_grad for p in backbone.parameters()
+    )
+    if backbone_has_trainable_params:
+        backbone.train()
+    else:
+        backbone.eval()
+
     projection_head.train()
 
     total_loss = 0.0
@@ -701,12 +735,11 @@ def train_simclr_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Estrai embedding dal backbone, poi proietta
-        h_a = backbone.encode(view_a, normalize=False)   # (N, 512)
-        h_b = backbone.encode(view_b, normalize=False)   # (N, 512)
+        h_a = backbone.encode(view_a, normalize=False)
+        h_b = backbone.encode(view_b, normalize=False)
 
-        z_a = projection_head(h_a)                       # (N, 128)
-        z_b = projection_head(h_b)                       # (N, 128)
+        z_a = projection_head(h_a)
+        z_b = projection_head(h_b)
 
         loss_output = criterion(z_a, z_b)
         loss = loss_output["loss"]
@@ -719,6 +752,6 @@ def train_simclr_epoch(
 
         if log_every > 0 and step % log_every == 0:
             avg = total_loss / total_steps
-            print(f"  step {step:04d} | simclr loss {avg:.4f}")
+            print(f"  step {step:04d} | self-supervised loss {avg:.4f}")
 
     return {"loss": total_loss / max(total_steps, 1)}
