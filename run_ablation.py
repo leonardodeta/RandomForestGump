@@ -11,37 +11,48 @@ Expected structure:
 
 ``ground_truth.json`` format:
     {"query_filename.jpg": ["matching_gallery_1.jpg", "matching_gallery_2.jpg"]}
+
+The metric denominator is the number of validation queries with non-empty ground
+truth, not merely the number of predictions produced by the pipeline. Missing
+predictions are therefore counted as errors instead of being silently ignored.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 from pathlib import Path
 from typing import Dict, List
-
-from crop_faces import crop_folder
-from facenet_encoder import FaceNetEncoder
-from run_competition import load_folder, pick_device
-from search_system import RetrievalSystem
 
 
 def compute_metrics(
     predictions: Dict[str, List[str]],
     ground_truth: Dict[str, List[str]],
 ) -> Dict[str, float]:
-    """Compute Top-1, Top-5, Top-10 and weighted competition score."""
+    """Compute Top-1, Top-5, Top-10 and weighted competition score.
+
+    Missing predictions for valid ground-truth queries are counted as wrong.
+    Extra predictions that are not present in ground truth are reported but do
+    not affect the denominator.
+    """
     top1 = top5 = top10 = 0
     evaluated = 0
-    skipped = 0
+    empty_ground_truth = 0
+    missing_predictions = 0
 
-    for qfn, pred in predictions.items():
-        truth = set(ground_truth.get(qfn, []))
+    for qfn, truth_values in ground_truth.items():
+        truth = set(truth_values or [])
         if not truth:
-            skipped += 1
+            empty_ground_truth += 1
             continue
 
         evaluated += 1
+        pred = predictions.get(qfn)
+        if pred is None:
+            missing_predictions += 1
+            pred = []
+
         if pred and pred[0] in truth:
             top1 += 1
         if any(p in truth for p in pred[:5]):
@@ -51,8 +62,10 @@ def compute_metrics(
 
     if evaluated == 0:
         raise ValueError(
-            "No predictions had a valid ground-truth entry. Check filename keys in ground_truth.json."
+            "No valid ground-truth entries found. Check ground_truth.json and filename keys."
         )
+
+    extra_predictions = len(set(predictions) - set(ground_truth))
 
     top1_acc = top1 / evaluated
     top5_acc = top5 / evaluated
@@ -65,11 +78,17 @@ def compute_metrics(
         "top10": top10_acc,
         "score": score,
         "evaluated": evaluated,
-        "skipped": skipped,
+        "empty_ground_truth": empty_ground_truth,
+        "missing_predictions": missing_predictions,
+        "extra_predictions": extra_predictions,
     }
 
 
 def evaluate(system, query_folder, gallery_folder, ground_truth):
+    # Heavy imports are kept inside the function so compute_metrics can be
+    # imported in lightweight tests without facenet-pytorch/MTCNN installed.
+    from run_competition import load_folder
+
     qi, qfn = load_folder(query_folder)
     gi, gfn = load_folder(gallery_folder)
     preds = system.run(qi, qfn, gi, gfn, verbose=False)
@@ -77,6 +96,8 @@ def evaluate(system, query_folder, gallery_folder, ground_truth):
 
 
 def _prepare_auto_cropped_val(val_folder: Path, output_folder: Path, image_size: int, device) -> Path:
+    from crop_faces import crop_folder
+
     if output_folder.exists():
         shutil.rmtree(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
@@ -88,6 +109,12 @@ def _prepare_auto_cropped_val(val_folder: Path, output_folder: Path, image_size:
 
 
 def main():
+    # Heavy imports are deliberately local. This makes the metric function usable
+    # in unit tests even on machines without the full face-recognition stack.
+    from facenet_encoder import FaceNetEncoder
+    from run_competition import pick_device
+    from search_system import RetrievalSystem
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--val-folder", required=True,
                         help="Validation folder with query/, gallery/, ground_truth.json")
@@ -142,8 +169,11 @@ def main():
             use_tta=True, use_kreciprocal=True, use_qe=True, use_mmr=True)),
     ]
 
-    print(f"\n{'Method':<28} {'Top-1':>7} {'Top-5':>7} {'Top-10':>7} {'Score':>8} {'Eval':>6} {'Skip':>6}")
-    print("-" * 84)
+    print(
+        f"\n{'Method':<28} {'Top-1':>7} {'Top-5':>7} {'Top-10':>7} "
+        f"{'Score':>8} {'Eval':>6} {'Miss':>6} {'Extra':>6}"
+    )
+    print("-" * 92)
     for name, cfg in configs:
         system = RetrievalSystem(encoder=encoder, **cfg)
         metrics = evaluate(system, query_folder, gallery_folder, ground_truth)
@@ -151,7 +181,8 @@ def main():
             f"{name:<28} "
             f"{metrics['top1']:>7.3f} {metrics['top5']:>7.3f} "
             f"{metrics['top10']:>7.3f} {metrics['score']:>8.1f} "
-            f"{metrics['evaluated']:>6d} {metrics['skipped']:>6d}"
+            f"{metrics['evaluated']:>6d} {metrics['missing_predictions']:>6d} "
+            f"{metrics['extra_predictions']:>6d}"
         )
 
 

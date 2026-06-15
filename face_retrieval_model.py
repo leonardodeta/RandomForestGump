@@ -45,7 +45,7 @@ class TrainingConfig:
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
@@ -360,6 +360,11 @@ def create_optimizer(
             "lr": head_lr,
         })
 
+    if not param_groups:
+        raise ValueError(
+            "No trainable parameters were found. Unfreeze the backbone or attach a classifier/head before building the optimizer."
+        )
+
     return torch.optim.AdamW(
         param_groups,
         weight_decay=weight_decay,
@@ -400,6 +405,8 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         outputs = model(images)
+        if "logits" not in outputs:
+            raise ValueError("train_one_epoch requires a model with a classifier head.")
         logits = outputs["logits"]
 
         loss = F.cross_entropy(
@@ -452,6 +459,8 @@ def evaluate_classifier(
             raise ValueError("Validation batches must contain labels.")
 
         outputs = model(images)
+        if "logits" not in outputs:
+            raise ValueError("evaluate_classifier requires a model with a classifier head.")
         logits = outputs["logits"]
 
         loss = F.cross_entropy(logits, labels)
@@ -540,36 +549,48 @@ def rank_gallery_for_queries(
     chunk_size: int = 512,
 ) -> torch.Tensor:
     """
-    Computes cosine similarity through matrix multiplication.
+    Computes cosine-similarity rankings for query/gallery embeddings.
 
-    Assumes both query_embeddings and gallery_embeddings are already L2-normalized.
+    The function defensively normalizes embeddings and clamps ``top_k`` to the
+    number of available gallery items, so it is safe on small validation sets.
 
     Returns:
-        topk_indices: LongTensor [num_queries, top_k]
+        LongTensor [num_queries, min(top_k, num_gallery)].
     """
-    query_embeddings = F.normalize(query_embeddings, p=2, dim=1)
-    gallery_embeddings = F.normalize(gallery_embeddings, p=2, dim=1)
+    if query_embeddings.ndim != 2 or gallery_embeddings.ndim != 2:
+        raise ValueError("query_embeddings and gallery_embeddings must be 2-D tensors")
+    if query_embeddings.size(1) != gallery_embeddings.size(1):
+        raise ValueError("query and gallery embeddings must have the same dimension")
+    if query_embeddings.size(0) == 0:
+        raise ValueError("query_embeddings is empty")
+    if gallery_embeddings.size(0) == 0:
+        raise ValueError("gallery_embeddings is empty")
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+
+    safe_top_k = min(int(top_k), gallery_embeddings.size(0))
+
+    query_embeddings = F.normalize(query_embeddings.float(), p=2, dim=1)
+    gallery_embeddings = F.normalize(gallery_embeddings.float(), p=2, dim=1)
 
     all_topk = []
 
     for start in range(0, query_embeddings.size(0), chunk_size):
         end = start + chunk_size
-
         query_chunk = query_embeddings[start:end]
         similarity = query_chunk @ gallery_embeddings.T
-
         _, topk_indices = torch.topk(
             similarity,
-            k=top_k,
+            k=safe_top_k,
             dim=1,
             largest=True,
             sorted=True,
         )
-
         all_topk.append(topk_indices.cpu())
 
     return torch.cat(all_topk, dim=0)
-
 
 def build_retrieval_dictionary(
     query_filenames: Sequence[str],
@@ -617,7 +638,9 @@ def retrieval_topk_accuracy(
     A query is correct at Top-k if at least one of the first k gallery
     images has the same identity label.
     """
-    max_k = max(ks)
+    if gallery_embeddings.size(0) == 0:
+        raise ValueError("gallery_embeddings is empty")
+    max_k = min(max(ks), gallery_embeddings.size(0))
 
     topk_indices = rank_gallery_for_queries(
         query_embeddings=query_embeddings,
@@ -631,7 +654,8 @@ def retrieval_topk_accuracy(
     metrics = {}
 
     for k in ks:
-        retrieved_labels = gallery_labels[topk_indices[:, :k]]
+        effective_k = min(k, topk_indices.size(1))
+        retrieved_labels = gallery_labels[topk_indices[:, :effective_k]]
         correct = (retrieved_labels == query_labels.unsqueeze(1)).any(dim=1)
         metrics[f"top{k}"] = correct.float().mean().item()
 

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
-from PIL import Image, ImageOps
+from PIL import Image
 from torch.utils.data import DataLoader
 
 from encoder import Encoder
@@ -38,7 +38,6 @@ from face_retrieval_model import (
 )
 from loss_functions import NTXentLoss, TripletLoss
 from run_ablation import compute_metrics
-from run_competition import load_folder
 from search_system import RetrievalSystem
 from train_finetune import PairDataset, train_simclr_epoch
 
@@ -47,6 +46,28 @@ DEFAULT_IMAGE_SIZE = {
     "inception_resnet_v1": 160,
     "inception_resnet_v2": 299,
 }
+
+VALID_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
+
+
+def load_folder(folder: str | Path):
+    """Load all images from a flat folder while preserving filenames.
+
+    A local copy is used here instead of importing run_competition.py so that
+    validation inside this training script does not pull in submission/cropping
+    dependencies unnecessarily.
+    """
+    folder = Path(folder)
+    if not folder.exists():
+        raise FileNotFoundError(f"Image folder does not exist: {folder}")
+
+    images, filenames = [], []
+    for path in sorted(folder.iterdir()):
+        if path.is_file() and path.name.lower().endswith(VALID_EXTENSIONS):
+            with Image.open(path) as img:
+                images.append(img.convert("RGB").copy())
+            filenames.append(path.name)
+    return images, filenames
 
 
 class InMemoryModelEncoder(Encoder):
@@ -141,6 +162,11 @@ def _save_selfsup_checkpoint(
         "train_loss": train_loss,
         "image_size": DEFAULT_IMAGE_SIZE[model.arch] if model.arch == "inception_resnet_v2" else args.image_size,
         "validation_metrics": validation_metrics,
+        "known_limitation": (
+            "Two-view self-supervised training can create false negatives when "
+            "different images of the same identity appear in the same batch. "
+            "Use validation ablations before preferring this checkpoint over the pretrained baseline."
+        ),
     }
     save_checkpoint(path, model, config=config, extra=extra)
 
@@ -181,6 +207,7 @@ def main():
     device = get_device()
     resolved_arch = _peek_checkpoint_arch(args.resume, args.arch)
     image_size = DEFAULT_IMAGE_SIZE[resolved_arch] if resolved_arch == "inception_resnet_v2" else args.image_size
+    args.image_size = image_size
 
     print(f"[selfsup_train] device       = {device}")
     print(f"[selfsup_train] data         = {args.data_folder}")
@@ -189,8 +216,21 @@ def main():
     print(f"[selfsup_train] arch         = {resolved_arch}")
     print(f"[selfsup_train] image_size   = {image_size}")
     print(f"[selfsup_train] loss         = {args.loss}")
+    print(
+        "[selfsup_train] warning      = self-supervised positives/negatives are built without identity labels; "
+        "false negatives are possible if the same person appears twice in a batch."
+    )
+    if args.val_folder is None:
+        print(
+            "[selfsup_train] warning      = no validation folder was provided; checkpoint selection will use training loss only."
+        )
 
     dataset = PairDataset(root=args.data_folder, image_size=image_size)
+    if len(dataset) < args.batch_size:
+        print(
+            f"[selfsup_train] warning      = dataset has {len(dataset)} images, smaller than batch size {args.batch_size}; "
+            "drop_last is disabled for this run."
+        )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
