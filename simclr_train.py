@@ -286,9 +286,8 @@ def main():
     best_value = float("-inf") if args.val_folder else float("inf")
     saved_any_checkpoint = False
 
-    # --------------------------------------------------------
     # Stage 1: train projection head only; do not save backbone.
-    # --------------------------------------------------------
+
     if args.freeze_stage_epochs > 0:
         print(f"\n[Stage 1] Frozen backbone for {args.freeze_stage_epochs} epoch(s)")
         freeze_backbone(model)
@@ -319,9 +318,8 @@ def main():
                 "no backbone checkpoint saved in Stage 1"
             )
 
-    # --------------------------------------------------------
     # Stage 2: partially fine-tune backbone. Save checkpoints here.
-    # --------------------------------------------------------
+
     finetune_epochs = max(0, args.epochs - args.freeze_stage_epochs)
     if finetune_epochs > 0:
         print(f"\n[Stage 2] Fine-tuning final backbone layers for {finetune_epochs} epoch(s)")
