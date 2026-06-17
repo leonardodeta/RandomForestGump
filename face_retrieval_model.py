@@ -23,9 +23,7 @@ except ImportError:
     timm = None
 
 
-# ============================================================
 # Configuration
-# ============================================================
 
 @dataclass
 class TrainingConfig:
@@ -50,9 +48,7 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-# ============================================================
 # Transform expected by FaceNet-style model
-# ============================================================
 
 def get_face_transform(image_size: int = 160):
     """
@@ -71,9 +67,7 @@ def get_face_transform(image_size: int = 160):
     ])
 
 
-# ============================================================
 # Batch handling
-# ============================================================
 
 def unpack_batch(
     batch,
@@ -147,13 +141,8 @@ def unpack_batch(
     return images, labels, filenames
 
 
-# ============================================================
 # Model: pretrained face-recognition backbone + classifier head
-# ============================================================
-
-# ============================================================
 # Projection head (usato solo durante SimCLR training)
-# ============================================================
 
 class ProjectionHead(nn.Module):
     """
@@ -271,9 +260,7 @@ class FaceRetrievalModel(nn.Module):
         return embeddings
 
 
-# ============================================================
 # Freezing / unfreezing strategy
-# ============================================================
 
 
 def freeze_backbone(model: FaceRetrievalModel) -> None:
@@ -326,9 +313,7 @@ def unfreeze_full_backbone(model: FaceRetrievalModel) -> None:
         param.requires_grad = True
 
 
-# ============================================================
 # Optimizer
-# ============================================================
 
 def create_optimizer(
     model: FaceRetrievalModel,
@@ -370,10 +355,7 @@ def create_optimizer(
         weight_decay=weight_decay,
     )
 
-
-# ============================================================
 # Training and classification validation
-# ============================================================
 
 def train_one_epoch(
     model: FaceRetrievalModel,
@@ -478,9 +460,7 @@ def evaluate_classifier(
     }
 
 
-# ============================================================
 # Embedding extraction
-# ============================================================
 
 @torch.no_grad()
 def extract_embeddings(
@@ -537,10 +517,7 @@ def extract_embeddings(
 
     return embeddings, labels_out, filenames_out
 
-
-# ============================================================
 # Similarity search / retrieval
-# ============================================================
 
 def rank_gallery_for_queries(
     query_embeddings: torch.Tensor,
@@ -620,10 +597,7 @@ def build_retrieval_dictionary(
 
     return results
 
-
-# ============================================================
 # Retrieval validation
-# ============================================================
 
 def retrieval_topk_accuracy(
     query_embeddings: torch.Tensor,
@@ -721,10 +695,7 @@ def evaluate_retrieval(
 
     return metrics
 
-
-# ============================================================
 # Full two-stage training
-# ============================================================
 
 def fit_two_stage_model(
     model: FaceRetrievalModel,
@@ -780,9 +751,8 @@ def fit_two_stage_model(
             best_state = copy.deepcopy(model.state_dict())
             print(f"New best model. Score: {best_score:.2f}")
 
-    # -------------------------
     # Stage 1
-    # -------------------------
+    
     if config.stage1_epochs > 0:
         print("\nStage 1: training classifier head with frozen backbone")
         freeze_backbone(model)
@@ -812,9 +782,8 @@ def fit_two_stage_model(
 
             maybe_validate(f"stage 1 epoch {epoch}")
 
-    # -------------------------
     # Stage 2
-    # -------------------------
+
     if config.stage2_epochs > 0:
         print("\nStage 2: fine-tuning last backbone layers")
         unfreeze_last_backbone_layers(model)
@@ -851,9 +820,7 @@ def fit_two_stage_model(
     return model
 
 
-# ============================================================
 # Final test retrieval
-# ============================================================
 
 @torch.no_grad()
 def make_test_submission_dictionary(
@@ -905,9 +872,7 @@ def make_test_submission_dictionary(
     return results
 
 
-# ============================================================
 # Checkpoint utilities
-# ============================================================
 
 def save_checkpoint(
     path: str,
@@ -983,10 +948,6 @@ def load_checkpoint(
 
     return model, config, label_to_identity
 
-
-# ============================================================
-# Example usage with your existing data pipeline
-# ============================================================
 
 def run_training_and_retrieval(
     train_loader: Iterable,
