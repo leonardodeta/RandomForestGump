@@ -3,18 +3,12 @@ facenet_encoder.py
 ------------------
 Encoder implementation based on FaceRetrievalModel.
 
-Usage modes:
-
-1. Strong pretrained baseline:
-       encoder = FaceNetEncoder(device)
-
-2. Fine-tuned checkpoint:
-       encoder = FaceNetEncoder(device, checkpoint_path="selfsup_checkpoint.pt")
-
-When a checkpoint is provided, the architecture stored inside the checkpoint is
-used automatically. This prevents loading an Inception-ResNet-V2 checkpoint into
-an Inception-ResNet-V1 model by mistake.
+If a checkpoint is provided, the checkpoint metadata is used to restore both the
+architecture and the input image size. This avoids silently resizing inference
+images differently from the training run that produced the checkpoint.
 """
+
+from __future__ import annotations
 
 from typing import List, Optional
 
@@ -22,26 +16,10 @@ import torch
 from PIL import Image
 
 from encoder import Encoder
-from face_retrieval_model import FaceRetrievalModel, load_checkpoint, get_face_transform
+from face_retrieval_model import FaceRetrievalModel, get_face_transform, load_checkpoint
 
 
 class FaceNetEncoder(Encoder):
-    """
-    Feature extractor based on FaceRetrievalModel.
-
-    arch='inception_resnet_v1': FaceNet InceptionResNetV1 pretrained on VGGFace2,
-                                512-d embeddings, 160px input.
-    arch='inception_resnet_v2': timm InceptionResNetV2 pretrained on ImageNet,
-                                1536-d embeddings, 299px input.
-
-    Args:
-        device:          torch.device used for inference.
-        checkpoint_path: optional checkpoint saved by the training scripts.
-        image_size:      input side length. If None, uses the architecture default.
-        arch:            architecture for pretrained mode. If checkpoint_path is
-                         provided, the checkpoint metadata takes precedence.
-    """
-
     _DEFAULT_IMAGE_SIZE = {
         "inception_resnet_v1": 160,
         "inception_resnet_v2": 299,
@@ -56,7 +34,14 @@ class FaceNetEncoder(Encoder):
     ):
         self.device = device
 
+        checkpoint_image_size = None
         if checkpoint_path is not None:
+            # Read lightweight metadata before constructing the model. We still
+            # call load_checkpoint for the actual model restoration.
+            metadata = torch.load(checkpoint_path, map_location="cpu")
+            config = metadata.get("config", None)
+            checkpoint_image_size = metadata.get("image_size", None) or getattr(config, "image_size", None)
+
             model, _, _ = load_checkpoint(checkpoint_path, device)
             resolved_arch = model.arch
             if arch != resolved_arch:
@@ -74,23 +59,34 @@ class FaceNetEncoder(Encoder):
             ).to(device)
             print(f"[FaceNetEncoder] Using pretrained weights ({resolved_arch}).")
 
+        if resolved_arch not in self._DEFAULT_IMAGE_SIZE:
+            raise ValueError(f"Unsupported architecture: {resolved_arch}")
+
+        if image_size is not None:
+            resolved_image_size = int(image_size)
+        elif checkpoint_image_size is not None:
+            resolved_image_size = int(checkpoint_image_size)
+        else:
+            resolved_image_size = self._DEFAULT_IMAGE_SIZE[resolved_arch]
+
+        if resolved_image_size <= 0:
+            raise ValueError("image_size must be positive")
+
         self.arch = resolved_arch
         self._emb_dim = model.embedding_dim
-        self.image_size = image_size or self._DEFAULT_IMAGE_SIZE[resolved_arch]
+        self.image_size = resolved_image_size
         self.transform = get_face_transform(self.image_size)
         self.model = model.eval()
+
+        print(f"[FaceNetEncoder] image_size = {self.image_size}")
 
     @property
     def embedding_dim(self) -> int:
         return self._emb_dim
 
     def embed_batch(self, images: List[Image.Image]) -> torch.Tensor:
-        """
-        Receives a list of PIL images and returns a CPU tensor of shape
-        (N, embedding_dim). The RetrievalSystem performs the final normalization.
-        """
         if not images:
-            return torch.empty((0, self.embedding_dim))
+            return torch.empty((0, self.embedding_dim), dtype=torch.float32)
 
         tensors = torch.stack([
             self.transform(img.convert("RGB")) for img in images

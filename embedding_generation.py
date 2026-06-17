@@ -262,34 +262,45 @@ def compute_topk_indices(
 
         similarity = normalized_query @ normalized_gallery.T
 
-    Chunking avoids creating a huge matrix all at once.
+    Chunking avoids creating a huge matrix all at once. The requested ``top_k``
+    is clamped to the gallery size, so this function is safe on tiny validation
+    sets and will not crash when ``top_k > num_gallery``.
     """
+
+    if query_embeddings.ndim != 2 or gallery_embeddings.ndim != 2:
+        raise ValueError("query_embeddings and gallery_embeddings must be 2-D tensors")
+    if query_embeddings.size(0) == 0:
+        raise ValueError("query_embeddings is empty")
+    if gallery_embeddings.size(0) == 0:
+        raise ValueError("gallery_embeddings is empty")
+    if query_embeddings.size(1) != gallery_embeddings.size(1):
+        raise ValueError("query and gallery embeddings must have the same dimension")
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
 
     if device is None:
         device = get_device()
 
-    query_embeddings = F.normalize(query_embeddings, p=2, dim=1)
-    gallery_embeddings = F.normalize(gallery_embeddings, p=2, dim=1)
+    safe_top_k = min(int(top_k), gallery_embeddings.size(0))
 
-    gallery_embeddings = gallery_embeddings.to(device)
+    query_embeddings = F.normalize(query_embeddings.float(), p=2, dim=1)
+    gallery_embeddings = F.normalize(gallery_embeddings.float(), p=2, dim=1).to(device)
 
     all_topk_indices = []
 
     for start in range(0, query_embeddings.size(0), chunk_size):
         end = start + chunk_size
-
         query_chunk = query_embeddings[start:end].to(device)
-
         similarity = query_chunk @ gallery_embeddings.T
-
         _, topk_indices = torch.topk(
             similarity,
-            k=top_k,
+            k=safe_top_k,
             dim=1,
             largest=True,
             sorted=True,
         )
-
         all_topk_indices.append(topk_indices.cpu())
 
     return torch.cat(all_topk_indices, dim=0)

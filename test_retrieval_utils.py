@@ -17,17 +17,33 @@ import unittest
 import torch
 
 from diversification import mmr_rerank
+from embedding_generation import compute_topk_indices
 from reranking import alpha_query_expansion, k_reciprocal_rerank
 from run_ablation import compute_metrics
+from search_system import RetrievalSystem
+from test_pipeline import DummyEncoder
 
 
 class RetrievalUtilityTests(unittest.TestCase):
+    def test_retrieval_system_default_is_conservative(self):
+        system = RetrievalSystem(encoder=DummyEncoder())
+        self.assertTrue(system.use_tta)
+        self.assertFalse(system.use_kreciprocal)
+        self.assertFalse(system.use_qe)
+        self.assertFalse(system.use_mmr)
+
     def test_k_reciprocal_handles_identical_embeddings_without_nan(self):
         query = torch.nn.functional.normalize(torch.ones(2, 4), p=2, dim=1)
         gallery = torch.nn.functional.normalize(torch.ones(5, 4), p=2, dim=1)
         dist = k_reciprocal_rerank(query, gallery, k1=20, k2=6)
         self.assertEqual(tuple(dist.shape), (2, 5))
         self.assertTrue(torch.isfinite(dist).all().item())
+
+    def test_k_reciprocal_memory_guard(self):
+        query = torch.nn.functional.normalize(torch.randn(4, 8), p=2, dim=1)
+        gallery = torch.nn.functional.normalize(torch.randn(4, 8), p=2, dim=1)
+        with self.assertRaises(MemoryError):
+            k_reciprocal_rerank(query, gallery, max_matrix_elements=10)
 
     def test_alpha_query_expansion_clamps_top_k_to_gallery_size(self):
         query = torch.nn.functional.normalize(torch.randn(3, 8), p=2, dim=1)
@@ -36,6 +52,12 @@ class RetrievalUtilityTests(unittest.TestCase):
         self.assertEqual(tuple(expanded.shape), tuple(query.shape))
         norms = expanded.norm(dim=1)
         self.assertTrue(torch.allclose(norms, torch.ones_like(norms), atol=1e-5))
+
+    def test_embedding_generation_topk_clamps_to_gallery_size(self):
+        query = torch.nn.functional.normalize(torch.randn(3, 8), p=2, dim=1)
+        gallery = torch.nn.functional.normalize(torch.randn(2, 8), p=2, dim=1)
+        idx = compute_topk_indices(query, gallery, top_k=10, chunk_size=2, device=torch.device("cpu"))
+        self.assertEqual(tuple(idx.shape), (3, 2))
 
     def test_mmr_pool_smaller_than_top_k_still_returns_unique_results(self):
         scores = torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.5, 0.4]])

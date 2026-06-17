@@ -927,6 +927,7 @@ def save_checkpoint(
         "model_state_dict": model.state_dict(),
         "arch": model.arch,
         "embedding_dim": model.embedding_dim,
+        "image_size": getattr(config, "image_size", None) if config is not None else None,
         "num_classes": getattr(config, "num_classes", None) if config is not None else None,
         "config": config,
         "label_to_identity": label_to_identity,
@@ -948,7 +949,10 @@ def load_checkpoint(
     path: str,
     device: torch.device,
 ) -> Tuple[FaceRetrievalModel, Optional[TrainingConfig], Optional[Dict[int, str]]]:
-    checkpoint = torch.load(path, map_location=device)
+    try:
+        checkpoint = torch.load(path, map_location=device)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=device)
 
     config = checkpoint.get("config", None)
     arch = _get_checkpoint_arch(checkpoint)

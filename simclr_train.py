@@ -16,9 +16,11 @@ is not saved as the best backbone checkpoint.
 """
 
 import argparse
+import random
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -48,6 +50,17 @@ DEFAULT_IMAGE_SIZE = {
 }
 
 VALID_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
+
+
+def set_seed(seed: int = 42, deterministic: bool = False) -> None:
+    """Set common random seeds for reproducible self-supervised runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def load_folder(folder: str | Path):
@@ -161,6 +174,8 @@ def _save_selfsup_checkpoint(
         "stage": stage,
         "train_loss": train_loss,
         "image_size": DEFAULT_IMAGE_SIZE[model.arch] if model.arch == "inception_resnet_v2" else args.image_size,
+        "seed": args.seed,
+        "deterministic": bool(getattr(args, "deterministic", False)),
         "validation_metrics": validation_metrics,
         "known_limitation": (
             "Two-view self-supervised training can create false negatives when "
@@ -202,9 +217,14 @@ def main():
     parser.add_argument("--arch", default="inception_resnet_v1",
                         choices=["inception_resnet_v1", "inception_resnet_v2"],
                         help="Backbone architecture for a fresh run")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for Python, NumPy, and PyTorch")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Use deterministic CUDA kernels where possible; may slow training")
     args = parser.parse_args()
 
     device = get_device()
+    set_seed(args.seed, deterministic=args.deterministic)
     resolved_arch = _peek_checkpoint_arch(args.resume, args.arch)
     image_size = DEFAULT_IMAGE_SIZE[resolved_arch] if resolved_arch == "inception_resnet_v2" else args.image_size
     args.image_size = image_size
@@ -216,6 +236,7 @@ def main():
     print(f"[selfsup_train] arch         = {resolved_arch}")
     print(f"[selfsup_train] image_size   = {image_size}")
     print(f"[selfsup_train] loss         = {args.loss}")
+    print(f"[selfsup_train] seed         = {args.seed}")
     print(
         "[selfsup_train] warning      = self-supervised positives/negatives are built without identity labels; "
         "false negatives are possible if the same person appears twice in a batch."
@@ -231,6 +252,8 @@ def main():
             f"[selfsup_train] warning      = dataset has {len(dataset)} images, smaller than batch size {args.batch_size}; "
             "drop_last is disabled for this run."
         )
+    generator = torch.Generator()
+    generator.manual_seed(args.seed)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -238,6 +261,7 @@ def main():
         num_workers=args.workers,
         pin_memory=(device.type == "cuda"),
         drop_last=(len(dataset) >= args.batch_size),
+        generator=generator,
     )
 
     if args.resume:

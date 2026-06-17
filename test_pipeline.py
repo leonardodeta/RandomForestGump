@@ -4,14 +4,7 @@ test_pipeline.py
 Lightweight smoke tests for the retrieval pipeline.
 
 Default mode uses a deterministic dummy encoder, so the test does not require
-facenet-pytorch, pretrained weights, or internet access. This makes it useful as
-a quick sanity check on any machine.
-
-Usage:
-    python test_pipeline.py
-
-Optional integration check with the real FaceNet encoder:
-    python test_pipeline.py --with-facenet
+facenet-pytorch, pretrained weights, or internet access.
 """
 
 from __future__ import annotations
@@ -29,13 +22,6 @@ from search_system import RetrievalSystem
 
 
 class DummyEncoder(Encoder):
-    """Deterministic encoder used for fast pipeline tests.
-
-    It maps the mean RGB value of each image to a small embedding vector. This is
-    not a meaningful face model; it only verifies that batching, ranking, TTA,
-    MMR, and output formatting work without depending on pretrained weights.
-    """
-
     def __init__(self, embedding_dim: int = 8):
         self._embedding_dim = embedding_dim
 
@@ -68,7 +54,6 @@ def run_lightweight_tests() -> None:
     print("LIGHTWEIGHT RETRIEVAL PIPELINE TEST")
     print("=" * 60)
 
-    # Utility-level checks.
     q = torch.nn.functional.normalize(torch.ones(2, 4), p=2, dim=1)
     g = torch.nn.functional.normalize(torch.ones(6, 4), p=2, dim=1)
     dist = k_reciprocal_rerank(q, g, k1=20, k2=6)
@@ -78,9 +63,8 @@ def run_lightweight_tests() -> None:
     expanded = alpha_query_expansion(q, g[:2], top_k=5)
     assert expanded.shape == q.shape
     assert torch.isfinite(expanded).all(), "query expansion produced NaN/Inf values"
-    print("[1/3] Utility functions OK")
+    print("[1/4] Utility functions OK")
 
-    # Full RetrievalSystem check with dummy embeddings.
     num_query = 5
     num_gallery = 20
     query_images = [make_image(i) for i in range(num_query)]
@@ -88,31 +72,31 @@ def run_lightweight_tests() -> None:
     query_names = [f"query_{i:03d}.jpg" for i in range(num_query)]
     gallery_names = [f"gallery_{i:03d}.jpg" for i in range(num_gallery)]
 
-    system = RetrievalSystem(
+    default_system = RetrievalSystem(encoder=DummyEncoder())
+    assert default_system.use_tta is True
+    assert default_system.use_kreciprocal is False
+    assert default_system.use_qe is False
+    assert default_system.use_mmr is False
+    print("[2/4] Conservative defaults OK")
+
+    advanced = RetrievalSystem(
         encoder=DummyEncoder(),
         use_tta=True,
         use_kreciprocal=True,
         use_qe=True,
         use_mmr=True,
         top_k_output=10,
-        mmr_initial_pool=5,  # deliberately smaller than top_k; should be handled safely
+        mmr_initial_pool=5,
     )
-    results = system.run(
-        query_images,
-        query_names,
-        gallery_images,
-        gallery_names,
-        verbose=False,
-    )
+    results = advanced.run(query_images, query_names, gallery_images, gallery_names, verbose=False)
 
     assert set(results) == set(query_names)
     for qname, ranked in results.items():
         assert len(ranked) == 10, f"{qname}: expected 10 results, got {len(ranked)}"
         assert len(set(ranked)) == 10, f"{qname}: duplicate gallery results: {ranked}"
         assert all(name in gallery_names for name in ranked)
-    print("[2/3] RetrievalSystem output format OK")
+    print("[3/4] Advanced RetrievalSystem output format OK")
 
-    # Baseline cosine path too, because it is the safest competition fallback.
     baseline = RetrievalSystem(
         encoder=DummyEncoder(),
         use_tta=False,
@@ -121,15 +105,10 @@ def run_lightweight_tests() -> None:
         use_mmr=False,
         top_k_output=10,
     )
-    baseline_results = baseline.run(
-        query_images,
-        query_names,
-        gallery_images,
-        gallery_names,
-        verbose=False,
-    )
+    q_feats, g_feats = baseline.embed_collections(query_images, gallery_images)
+    baseline_results = baseline.run_from_embeddings(q_feats, query_names, g_feats, gallery_names)
     assert all(len(v) == 10 for v in baseline_results.values())
-    print("[3/3] Baseline cosine path OK")
+    print("[4/4] Cached-embedding cosine path OK")
 
     print("\nAll lightweight tests passed.")
 
@@ -150,8 +129,7 @@ def run_facenet_integration_test() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--with-facenet", action="store_true",
-                        help="Also run a real FaceNetEncoder integration check")
+    parser.add_argument("--with-facenet", action="store_true", help="Also run a real FaceNetEncoder integration check")
     args = parser.parse_args()
 
     run_lightweight_tests()

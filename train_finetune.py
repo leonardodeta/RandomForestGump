@@ -10,12 +10,16 @@ with the pretrained FaceNet encoder without using this module.
 
 
 import copy
+import random
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from loss_functions import ArcFaceLoss, CosFaceLoss, NormalizedSoftmaxLoss
 
 
 # ============================================================
@@ -38,6 +42,17 @@ class FineTuneConfig:
     weight_decay: float = 1e-4
     label_smoothing: float = 0.05
 
+    # Supervised objective. "cross_entropy" uses the model classifier head.
+    # The angular-margin alternatives are better aligned with cosine retrieval,
+    # but should still be validated before use.
+    supervised_loss: str = "cross_entropy"
+    margin: float = 0.35
+    scale: float = 30.0
+
+    # Reproducibility and checkpoint metadata
+    seed: int = 42
+    image_size: int = 160
+
     # Retrieval validation
     top_k: int = 10
     use_flip_tta: bool = True
@@ -56,6 +71,18 @@ def get_device() -> torch.device:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+
+def set_seed(seed: int = 42, deterministic: bool = False) -> None:
+    """Set common random seeds for reproducible training runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 # ============================================================
@@ -120,9 +147,6 @@ def freeze_backbone(model: nn.Module) -> None:
     if getattr(model, "classifier", None) is None:
         raise ValueError("Supervised fine-tuning requires model.classifier to be defined.")
 
-    if getattr(model, "classifier", None) is None:
-        raise ValueError("Supervised fine-tuning requires model.classifier to be defined.")
-
     for param in model.classifier.parameters():
         param.requires_grad = True
 
@@ -138,19 +162,26 @@ def unfreeze_last_layers(model: nn.Module) -> None:
     for param in model.backbone.parameters():
         param.requires_grad = False
 
-    trainable_keywords = [
-        "repeat_3",
-        "block8",
-        "last_linear",
-        "last_bn",
-    ]
-
-    for name, param in model.backbone.named_parameters():
-        if any(keyword in name for keyword in trainable_keywords):
+    if getattr(model, "arch", "inception_resnet_v1") == "inception_resnet_v1":
+        trainable_keywords = [
+            "repeat_3",
+            "block8",
+            "last_linear",
+            "last_bn",
+        ]
+        for name, param in model.backbone.named_parameters():
+            if any(keyword in name for keyword in trainable_keywords):
+                param.requires_grad = True
+    else:
+        # timm Inception-ResNet-V2 names can vary by version; unfreeze the
+        # final parameter tensors instead of relying on exact block names.
+        named_params = list(model.backbone.named_parameters())
+        for _, param in named_params[-30:]:
             param.requires_grad = True
 
-    for param in model.classifier.parameters():
-        param.requires_grad = True
+    if getattr(model, "classifier", None) is not None:
+        for param in model.classifier.parameters():
+            param.requires_grad = True
 
 
 def unfreeze_full_backbone(model: nn.Module) -> None:
@@ -176,6 +207,7 @@ def build_optimizer(
     classifier_lr: float,
     backbone_lr: float,
     weight_decay: float,
+    extra_modules: Optional[Iterable[nn.Module]] = None,
 ) -> torch.optim.Optimizer:
 
     backbone_params = [
@@ -205,6 +237,19 @@ def build_optimizer(
             "lr": classifier_lr,
         })
 
+    if extra_modules is not None:
+        extra_params = [
+            p
+            for module in extra_modules
+            for p in module.parameters()
+            if p.requires_grad
+        ]
+        if extra_params:
+            param_groups.append({
+                "params": extra_params,
+                "lr": classifier_lr,
+            })
+
     if not param_groups:
         raise ValueError(
             "No trainable parameters found. Check the freezing strategy and classifier head."
@@ -215,6 +260,48 @@ def build_optimizer(
         weight_decay=weight_decay,
     )
 
+
+
+# ============================================================
+# Supervised objective
+# ============================================================
+
+def build_supervised_criterion(config: FineTuneConfig, embedding_dim: int) -> Optional[nn.Module]:
+    """Create an optional retrieval-oriented supervised loss.
+
+    ``None`` means ordinary cross entropy over the model classifier head.
+    The other options operate directly on embeddings and better match cosine
+    retrieval, but they should still be chosen only after validation.
+    """
+    name = config.supervised_loss.lower().replace("-", "_")
+    if name in {"cross_entropy", "ce"}:
+        return None
+    if name == "arcface":
+        return ArcFaceLoss(
+            num_classes=config.num_classes,
+            embedding_dim=embedding_dim,
+            scale=config.scale,
+            margin=config.margin,
+            label_smoothing=config.label_smoothing,
+        )
+    if name == "cosface":
+        return CosFaceLoss(
+            num_classes=config.num_classes,
+            embedding_dim=embedding_dim,
+            scale=config.scale,
+            margin=config.margin,
+            label_smoothing=config.label_smoothing,
+        )
+    if name in {"normalized_softmax", "norm_softmax"}:
+        return NormalizedSoftmaxLoss(
+            num_classes=config.num_classes,
+            embedding_dim=embedding_dim,
+            scale=config.scale,
+            label_smoothing=config.label_smoothing,
+        )
+    raise ValueError(
+        "Unsupported supervised_loss. Use cross_entropy, arcface, cosface, or normalized_softmax."
+    )
 
 # ============================================================
 # One training epoch
@@ -227,6 +314,7 @@ def train_one_epoch(
     device: torch.device,
     label_smoothing: float = 0.05,
     log_every: int = 25,
+    criterion: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
 
     model.train()
@@ -241,15 +329,24 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         outputs = model(images)
-        if "logits" not in outputs:
-            raise ValueError("train_one_epoch requires a model with a classifier head.")
-        logits = outputs["logits"]
-
-        loss = F.cross_entropy(
-            logits,
-            labels,
-            label_smoothing=label_smoothing,
-        )
+        if criterion is None:
+            if "logits" not in outputs:
+                raise ValueError("cross-entropy training requires a model with a classifier head.")
+            logits = outputs["logits"]
+            loss = F.cross_entropy(
+                logits,
+                labels,
+                label_smoothing=label_smoothing,
+            )
+        else:
+            raw_embeddings = outputs.get("raw_embeddings", outputs.get("embeddings"))
+            if raw_embeddings is None:
+                raise ValueError("metric-loss training requires model outputs to include embeddings")
+            loss_output = criterion(raw_embeddings, labels)
+            loss = loss_output["loss"]
+            logits = loss_output.get("logits", loss_output.get("cosine_logits"))
+            if logits is None:
+                raise ValueError("criterion output must include logits or cosine_logits for accuracy logging")
 
         loss.backward()
         optimizer.step()
@@ -467,8 +564,15 @@ def fine_tune_face_model(
         device = get_device()
 
     print(f"Using device: {device}")
+    set_seed(config.seed)
 
     model = model.to(device)
+    criterion = build_supervised_criterion(config, getattr(model, "embedding_dim"))
+    if criterion is not None:
+        criterion = criterion.to(device)
+        print(f"Using supervised retrieval loss: {config.supervised_loss}")
+    else:
+        print("Using supervised loss: cross_entropy")
 
     best_state = copy.deepcopy(model.state_dict())
     best_score = float("-inf")
@@ -517,8 +621,10 @@ def fine_tune_face_model(
                     "config": config,
                     "arch": getattr(model, "arch", "inception_resnet_v1"),
                     "num_classes": config.num_classes,
+                    "image_size": config.image_size,
                     "best_score": best_score,
                     "training_mode": "supervised_finetune",
+                    "supervised_loss": config.supervised_loss,
                 },
                 config.checkpoint_path,
             )
@@ -551,6 +657,7 @@ def fine_tune_face_model(
         classifier_lr=config.classifier_lr,
         backbone_lr=config.backbone_lr,
         weight_decay=config.weight_decay,
+        extra_modules=[criterion] if criterion is not None else None,
     )
 
     for epoch in range(1, config.frozen_epochs + 1):
@@ -561,6 +668,7 @@ def fine_tune_face_model(
             device=device,
             label_smoothing=config.label_smoothing,
             log_every=config.log_every,
+            criterion=criterion,
         )
 
         print(
@@ -588,6 +696,7 @@ def fine_tune_face_model(
         classifier_lr=config.classifier_lr * 0.2,
         backbone_lr=config.backbone_lr,
         weight_decay=config.weight_decay,
+        extra_modules=[criterion] if criterion is not None else None,
     )
 
     epochs_without_improvement = 0
@@ -600,6 +709,7 @@ def fine_tune_face_model(
             device=device,
             label_smoothing=config.label_smoothing,
             log_every=config.log_every,
+            criterion=criterion,
         )
 
         print(

@@ -8,8 +8,8 @@ Implemented methods:
    distances on L2-normalized embeddings.
 2. Alpha Query Expansion.
 
-These functions work only on tensors of embeddings. They are independent from
-FaceNet or any other encoder, which makes them easy to test in isolation.
+The functions are independent from FaceNet and are safe on small galleries:
+parameters are validated and clamped where appropriate.
 """
 
 from __future__ import annotations
@@ -37,29 +37,14 @@ def k_reciprocal_rerank(
     k1: int = 20,
     k2: int = 6,
     lambda_value: float = 0.3,
+    max_matrix_elements: int = 50_000_000,
 ) -> torch.Tensor:
-    """
-    Apply k-reciprocal re-ranking.
+    """Apply k-reciprocal re-ranking.
 
-    Args:
-        query_feats: Tensor of shape ``(M, D)``. Embeddings should already be
-            L2-normalized, but the function normalizes defensively.
-        gallery_feats: Tensor of shape ``(N, D)``. Embeddings should already be
-            L2-normalized, but the function normalizes defensively.
-        k1: Neighbourhood size for reciprocal-neighbour construction.
-        k2: Neighbourhood size for local query expansion over reciprocal sets.
-        lambda_value: Weight of the original cosine distance in the final
-            distance. ``0`` means only Jaccard distance; ``1`` means only the
-            original cosine distance.
-
-    Returns:
-        Tensor of shape ``(M, N)`` containing distances, where smaller values are
-        better matches.
-
-    Notes:
-        The method builds a full ``(M+N) x (M+N)`` matrix, so it is intended for
-        small or medium validation/test sets. Very large galleries may require a
-        chunked or approximate nearest-neighbour implementation.
+    The method builds a dense ``(num_query + num_gallery)^2`` matrix. The
+    ``max_matrix_elements`` guard prevents accidentally exhausting memory on a
+    large hidden set. Disable the guard only if you know the machine has enough
+    RAM.
     """
     _validate_feature_matrix("query_feats", query_feats)
     _validate_feature_matrix("gallery_feats", gallery_feats)
@@ -71,6 +56,8 @@ def k_reciprocal_rerank(
         raise ValueError("k1 must be >= 1")
     if k2 < 1:
         raise ValueError("k2 must be >= 1")
+    if max_matrix_elements < 1:
+        raise ValueError("max_matrix_elements must be >= 1")
 
     output_device = query_feats.device
 
@@ -79,19 +66,25 @@ def k_reciprocal_rerank(
 
     num_queries = query_np.shape[0]
     num_gallery = gallery_np.shape[0]
-    all_feats = np.concatenate([query_np, gallery_np], axis=0)
     total = num_queries + num_gallery
+    matrix_elements = total * total
+    if matrix_elements > max_matrix_elements:
+        raise MemoryError(
+            "k-reciprocal re-ranking would allocate a dense "
+            f"{total}x{total} matrix ({matrix_elements:,} elements), above the "
+            f"configured guard of {max_matrix_elements:,}. Use cosine ranking, "
+            "reduce the validation set, or increase --max-kreciprocal-matrix-elements."
+        )
 
-    # Clamp k values to the available number of items. The +1 convention below
-    # includes the item itself among its nearest neighbours.
+    all_feats = np.concatenate([query_np, gallery_np], axis=0)
+
+    # The +1 convention below includes the item itself among nearest neighbours.
     k1 = min(int(k1), max(total - 1, 1))
     k2 = min(int(k2), total)
 
     original_dist = 1.0 - all_feats @ all_feats.T
     original_dist = np.clip(original_dist, 0.0, 2.0).astype(np.float32)
 
-    # Zhong et al. normalize each column. The epsilon avoids NaNs when all
-    # distances in a column are zero, e.g. identical/collapsed embeddings.
     denom = np.max(original_dist, axis=0, keepdims=True)
     original_dist = original_dist / np.maximum(denom, _EPS)
     original_dist = np.nan_to_num(original_dist, nan=0.0, posinf=1.0, neginf=0.0)
@@ -164,13 +157,7 @@ def alpha_query_expansion(
     top_k: int = 5,
     alpha: float = 3.0,
 ) -> torch.Tensor:
-    """
-    Apply alpha query expansion.
-
-    For each query, the new query embedding is the normalized sum of the
-    original query and a weighted average of the top matching gallery features.
-    Similarities are clamped to non-negative values before exponentiation.
-    """
+    """Apply alpha query expansion to query embeddings."""
     _validate_feature_matrix("query_feats", query_feats)
     _validate_feature_matrix("gallery_feats", gallery_feats)
     if query_feats.size(1) != gallery_feats.size(1):
@@ -190,8 +177,6 @@ def alpha_query_expansion(
     weights = torch.clamp(top_sims, min=0.0) ** alpha
     weight_sums = weights.sum(dim=1, keepdim=True)
 
-    # If all top similarities are negative, the clamped weights are all zero.
-    # In that case fall back to a uniform average of the selected neighbours.
     uniform = torch.full_like(weights, 1.0 / safe_top_k)
     weights = torch.where(weight_sums > _EPS, weights / (weight_sums + _EPS), uniform)
 
