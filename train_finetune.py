@@ -21,10 +21,7 @@ import torch.nn.functional as F
 
 from loss_functions import ArcFaceLoss, CosFaceLoss, NormalizedSoftmaxLoss
 
-
-# ============================================================
 # Configuration
-# ============================================================
 
 @dataclass
 class FineTuneConfig:
@@ -84,10 +81,7 @@ def set_seed(seed: int = 42, deterministic: bool = False) -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-
-# ============================================================
 # Batch utilities
-# ============================================================
 
 def unpack_batch(batch, device: torch.device):
     """
@@ -130,9 +124,7 @@ def unpack_batch(batch, device: torch.device):
     return images, labels
 
 
-# ============================================================
 # Freezing strategy
-# ============================================================
 
 def freeze_backbone(model: nn.Module) -> None:
     """
@@ -197,10 +189,7 @@ def unfreeze_full_backbone(model: nn.Module) -> None:
 def count_trainable_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-
-# ============================================================
 # Optimizer
-# ============================================================
 
 def build_optimizer(
     model: nn.Module,
@@ -260,11 +249,7 @@ def build_optimizer(
         weight_decay=weight_decay,
     )
 
-
-
-# ============================================================
 # Supervised objective
-# ============================================================
 
 def build_supervised_criterion(config: FineTuneConfig, embedding_dim: int) -> Optional[nn.Module]:
     """Create an optional retrieval-oriented supervised loss.
@@ -303,9 +288,7 @@ def build_supervised_criterion(config: FineTuneConfig, embedding_dim: int) -> Op
         "Unsupported supervised_loss. Use cross_entropy, arcface, cosface, or normalized_softmax."
     )
 
-# ============================================================
 # One training epoch
-# ============================================================
 
 def train_one_epoch(
     model: nn.Module,
@@ -374,10 +357,7 @@ def train_one_epoch(
         "classification_accuracy": total_correct / max(total_examples, 1),
     }
 
-
-# ============================================================
 # Classification validation
-# ============================================================
 
 @torch.no_grad()
 def evaluate_classifier(
@@ -415,10 +395,7 @@ def evaluate_classifier(
         "classification_accuracy": total_correct / max(total_examples, 1),
     }
 
-
-# ============================================================
 # Embedding extraction for retrieval validation
-# ============================================================
 
 @torch.no_grad()
 def extract_embeddings_with_labels(
@@ -457,9 +434,7 @@ def extract_embeddings_with_labels(
     return all_embeddings, all_labels
 
 
-# ============================================================
 # Retrieval validation
-# ============================================================
 
 def compute_topk_retrieval_metrics(
     query_embeddings: torch.Tensor,
@@ -546,10 +521,7 @@ def evaluate_retrieval(
         top_k=top_k,
     )
 
-
-# ============================================================
 # Full fine-tuning procedure
-# ============================================================
 
 def fine_tune_face_model(
     model: nn.Module,
@@ -578,9 +550,7 @@ def fine_tune_face_model(
     best_score = float("-inf")
     epochs_without_improvement = 0
 
-    # --------------------------------------------------------
     # Helper: validate using retrieval, not only classification
-    # --------------------------------------------------------
 
     def run_retrieval_validation(stage_name: str, epoch: int) -> float:
         nonlocal best_state
@@ -640,9 +610,7 @@ def fine_tune_face_model(
 
         return score
 
-    # ========================================================
     # Stage 1: frozen backbone
-    # ========================================================
 
     print("\n==============================")
     print("Stage 1: frozen backbone")
@@ -679,9 +647,7 @@ def fine_tune_face_model(
 
         run_retrieval_validation("Stage 1", epoch)
 
-    # ========================================================
     # Stage 2: partial fine-tuning
-    # ========================================================
 
     print("\n==============================")
     print("Stage 2: fine-tune last layers")
@@ -724,9 +690,7 @@ def fine_tune_face_model(
             print("Early stopping triggered.")
             break
 
-    # ========================================================
     # Load best model
-    # ========================================================
 
     if val_query_loader is not None and val_gallery_loader is not None:
         model.load_state_dict(best_state)
@@ -735,9 +699,7 @@ def fine_tune_face_model(
     return model
 
 
-# ============================================================
 # SimCLR: dataset a coppie e training epoch
-# ============================================================
 
 import os
 from typing import Tuple
@@ -778,11 +740,11 @@ def _simclr_augmentation(image_size: int = 160) -> transforms.Compose:
 
 class PairDataset(Dataset):
     """
-    Carica immagini da una cartella (piatta o ImageFolder).
-    Per ogni immagine restituisce due augmentazioni diverse: (view_a, view_b).
-    Le label non vengono usate.
+    Loads images from a folder (flat or ImageFolder).
+    Returns two different augmentations for each image: (view_a, view_b).
+    Labels are not used.
 
-    Compatibile con CelebA (cartella piatta) e qualsiasi struttura ImageFolder.
+    Compatible with CelebA (flat folder) and any ImageFolder structure.
     """
 
     VALID_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
