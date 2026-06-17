@@ -1,13 +1,11 @@
 """
 encoder.py
 ----------
-Interfaccia astratta tra il MODELLO (che fa il compagno) e il SEARCH SYSTEM.
+Abstract interface between the MODEL — provided by the partner — and the SEARCH SYSTEM.
 
-Il compagno deve fornire una classe che eredita da `Encoder` e implementa
-`embed_batch`. Il search system non sa (e non deve sapere) cosa c'è dentro:
-puo' essere ResNet50 ImageNet, ResNet50 fine-tunato, ensemble, etc.
+The partner must provide a class that inherits from Encoder and implements embed_batch. The search system does not know, and must not know, what is inside: it could be ImageNet ResNet50, fine-tuned ResNet50, an ensemble, etc.
 
-Questo permette di sviluppare in parallelo senza pestarsi i piedi.
+This makes it possible to develop in parallel without getting in each other’s way.
 """
 
 from abc import ABC, abstractmethod
