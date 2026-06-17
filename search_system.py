@@ -86,9 +86,8 @@ class RetrievalSystem:
         )
         self._validate_config()
 
-    # ------------------------------------------------------------------ #
     # Compatibility properties for older code/tests.
-    # ------------------------------------------------------------------ #
+
     @property
     def query_batch_size(self) -> int: return self.config.query_batch_size
     @property
@@ -143,9 +142,8 @@ class RetrievalSystem:
                 if not 0.0 <= float(value) <= 1.0:
                     raise ValueError("MMR lambda values must be in [0, 1]")
 
-    # ------------------------------------------------------------------ #
     # Step 1: embedding extraction.
-    # ------------------------------------------------------------------ #
+
     def _embed(self, images: List[Image.Image], batch_size: int) -> torch.Tensor:
         if not images:
             raise ValueError("Cannot embed an empty image list")
@@ -182,9 +180,8 @@ class RetrievalSystem:
             self._embed(gallery_images, self.gallery_batch_size),
         )
 
-    # ------------------------------------------------------------------ #
     # Step 2: ranking.
-    # ------------------------------------------------------------------ #
+
     def _rank(self, query_feats: torch.Tensor, gallery_feats: torch.Tensor) -> torch.Tensor:
         if query_feats.ndim != 2 or gallery_feats.ndim != 2:
             raise ValueError("query_feats and gallery_feats must be 2-D tensors")
@@ -217,9 +214,8 @@ class RetrievalSystem:
 
         return query_feats @ gallery_feats.T
 
-    # ------------------------------------------------------------------ #
     # Step 3: top-k selection.
-    # ------------------------------------------------------------------ #
+
     def _select_top_k(self, score: torch.Tensor, gallery_feats: torch.Tensor) -> torch.Tensor:
         if score.ndim != 2:
             raise ValueError("score must have shape (num_queries, num_gallery)")
@@ -256,9 +252,8 @@ class RetrievalSystem:
             for i, qfn in enumerate(query_filenames)
         }
 
-    # ------------------------------------------------------------------ #
     # Public API.
-    # ------------------------------------------------------------------ #
+
     def run(
         self,
         query_images: List[Image.Image],
