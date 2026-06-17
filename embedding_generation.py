@@ -9,9 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ============================================================
 # Configuration
-# ============================================================
 
 @dataclass
 class EmbeddingConfig:
@@ -32,9 +30,8 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-# ============================================================
+
 # Batch unpacking
-# ============================================================
 
 def unpack_inference_batch(
     batch,
@@ -124,9 +121,7 @@ def unpack_inference_batch(
     return images, filenames, labels
 
 
-# ============================================================
 # Embedding extraction
-# ============================================================
 
 @torch.no_grad()
 def encode_batch(
@@ -212,9 +207,7 @@ def extract_embeddings(
     return embeddings, filenames_out, labels_out
 
 
-# ============================================================
 # Saving / loading embeddings
-# ============================================================
 
 def save_embedding_file(
     path: str,
@@ -244,9 +237,7 @@ def load_embedding_file(
     )
 
 
-# ============================================================
 # Similarity search
-# ============================================================
 
 def compute_topk_indices(
     query_embeddings: torch.Tensor,
@@ -356,9 +347,7 @@ def save_results_json(
     print(f"Saved retrieval results to: {path}")
 
 
-# ============================================================
 # Full block 3 pipeline
-# ============================================================
 
 @torch.no_grad()
 def generate_query_gallery_embeddings(
@@ -487,9 +476,7 @@ def make_retrieval_results(
     return results
 
 
-# ============================================================
 # Optional: validation metrics using embeddings
-# ============================================================
 
 def compute_retrieval_metrics_from_embeddings(
     query_embeddings: torch.Tensor,
