@@ -3,6 +3,16 @@
 Face retrieval project for the *Introduction to Machine Learning* exam.
 Given a set of query face images and a gallery of candidate images, the system returns the 10 most similar gallery images for each query.
 
+**Group:** RandomForestGump — *Introduction to Machine Learning*, University of Trento, 2026.
+
+**Authors:** Daniele Baraldi (266716), Leonardo Detassis (266898),
+Luca Ferrari (267301), Andrea Sanfilippo (266977).
+
+**Repository:** https://github.com/leonardodeta/random_forest_gump
+
+The full write-up (method, experiments, ablations and qualitative analysis) is in
+the project report (PDF).
+
 ## Requirements
 
 Use **Python 3.10 or newer**. The code uses modern type-hint syntax such as `str | Path`.
@@ -51,6 +61,37 @@ The validation metric counts every query with a non-empty ground-truth list. Mis
 ---
 
 ## Run the competition pipeline
+
+### Final configuration (best result: 760.33 / 1000)
+
+This is the exact setup that produced our best score. We first crop all query and
+gallery images with MTCNN, then run retrieval on the cropped folders with all
+post-processing components enabled and the tuned parameters.
+
+**1. Crop the images:**
+
+```bash
+python crop_faces.py --input /path/to/test   --output /path/to/test_cropped   --image-size 160
+```
+
+**2. Run the final pipeline on the cropped data:**
+
+```bash
+python run_competition.py \
+  --data-folder /path/to/test_cropped \
+  --group-name "RandomForestGump" \
+  --kreciprocal --k1 20 --k2 5 --kr-lambda 0.93 \
+  --qe --qe-top-k 10 --qe-alpha 3.0 \
+  --mmr --mmr-pool 60 \
+  --mmr-lambda 1.0 1.0 0.95 0.9 0.85 0.8 0.7 0.6 0.5 0.4 \
+  --submit-url http://videosim.disi.unitn.it:3001/retrieval/
+```
+
+The final system uses the **pretrained** FaceNet encoder (InceptionResNetV1 /
+VGGFace2, 512-d embeddings) with cosine similarity, horizontal-flip TTA,
+k-reciprocal re-ranking, MMR diversification and query expansion. No fine-tuned
+checkpoint is used: in our experiments none improved over the pretrained encoder.
+Add `--dry-run` to write `submission.json` locally instead of submitting.
 
 ### Safe default: TTA + cosine similarity
 
@@ -256,6 +297,25 @@ normalized_softmax
 ArcFace/CosFace are better aligned with cosine retrieval than a plain classifier head, but they should still be selected only after validation.
 
 ---
+
+## Project structure
+
+```text
+run_competition.py       Final retrieval pipeline: load data, embed, rank, submit.
+run_ablation.py          Ablation table and parameter sweeps on a validation folder.
+crop_faces.py            MTCNN face cropping (library + CLI), with resize fallback.
+encoder.py               Abstract encoder interface.
+facenet_encoder.py       FaceNet (InceptionResNetV1/V2) encoder wrapper.
+face_retrieval_model.py  Model definition and checkpoint load/save utilities.
+search_system.py         Orchestrates embedding, cosine ranking, TTA and post-processing.
+reranking.py             k-reciprocal re-ranking and alpha query expansion.
+diversification.py       MMR (Maximal Marginal Relevance) diversification.
+loss_functions.py        Supervised losses (ArcFace, CosFace, normalized-softmax).
+simclr_train.py          Self-supervised fine-tuning (triplet / NT-Xent).
+train_finetune.py        Supervised fine-tuning (cross-entropy / angular-margin).
+test_pipeline.py         End-to-end pipeline sanity checks.
+test_retrieval_utils.py  Unit tests for retrieval utilities.
+```
 
 ## Known limitations
 
