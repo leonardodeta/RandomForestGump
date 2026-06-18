@@ -3,42 +3,6 @@
 Face retrieval project for the *Introduction to Machine Learning* exam.
 Given a set of query face images and a gallery of candidate images, the system returns the 10 most similar gallery images for each query.
 
-The safest final pipeline is deliberately simple and defensible:
-
-1. optional face detection and cropping with MTCNN;
-2. face embedding extraction with a pretrained or validated fine-tuned FaceNet-style encoder;
-3. L2 normalization;
-4. cosine similarity ranking;
-5. optional validation-controlled additions: horizontal-flip TTA, k-reciprocal re-ranking, alpha query expansion, and MMR diversification;
-6. JSON submission to the competition server.
-
-The default final script uses **TTA + cosine similarity**. Heavier post-processing, such as k-reciprocal re-ranking, query expansion, and MMR, is opt-in and should be enabled only if validation ablations improve the score.
-
----
-
-## Final recommendation
-
-For the report/oral exam, present the stable baseline as:
-
-```text
-pretrained FaceNet / InceptionResnetV1 + L2-normalized embeddings + cosine similarity
-```
-
-Then justify optional components with the ablation table produced by `run_ablation.py`:
-
-```text
-+ horizontal flip TTA
-+ k-reciprocal re-ranking, only if validation improves
-+ alpha query expansion, only if validation improves
-+ MMR diversification, only if validation improves
-```
-
-MMR is especially delicate for identity retrieval because the task rewards returning several images of the same identity. Diversification can remove valid same-person matches, so it is disabled by default.
-
-The self-supervised fine-tuning script is an experimental extension. Since identity labels are not used during two-view self-supervised training, false negatives can occur when two different images of the same person appear in the same batch. Use it only if validation proves that the checkpoint beats the pretrained baseline.
-
----
-
 ## Requirements
 
 Use **Python 3.10 or newer**. The code uses modern type-hint syntax such as `str | Path`.
@@ -226,18 +190,6 @@ ablation_results.json
 
 Those files contain Top-1, Top-5, Top-10, weighted score, and the exact parameters used by each configuration.
 
-Recommended report table:
-
-| Method | Top-1 | Top-5 | Top-10 | Score |
-|---|---:|---:|---:|---:|
-| Cosine | fill from `ablation_results.csv` | fill | fill | fill |
-| + TTA | fill | fill | fill | fill |
-| + k-reciprocal | fill | fill | fill | fill |
-| + alpha-QE | fill | fill | fill | fill |
-| + MMR | fill | fill | fill | fill |
-
----
-
 ## Tests and sanity checks
 
 Run the lightweight tests:
@@ -312,11 +264,3 @@ ArcFace/CosFace are better aligned with cosine retrieval than a plain classifier
 - Face cropping can help with background clutter but can hurt if MTCNN fails or the dataset is already cleanly cropped.
 - Self-supervised fine-tuning can create false negatives because identity labels are not known during two-view training.
 - The pretrained FaceNet baseline is strong; use validation ablations to justify every optional component.
-
----
-
-## Oral-exam framing
-
-A strong way to explain the project is:
-
-> We built a modular face-retrieval system. The core baseline extracts FaceNet embeddings, normalizes them, and ranks gallery images by cosine similarity. Around this baseline, we implemented optional post-processing methods—TTA, k-reciprocal re-ranking, alpha query expansion, and MMR—and evaluated them through ablations and parameter sweeps. We keep the final configuration validation-driven rather than enabling every complex method by default.
