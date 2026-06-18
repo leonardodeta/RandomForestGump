@@ -9,9 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ============================================================
 # Configuration
-# ============================================================
 
 @dataclass
 class EmbeddingConfig:
@@ -32,9 +30,8 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-# ============================================================
+
 # Batch unpacking
-# ============================================================
 
 def unpack_inference_batch(
     batch,
@@ -124,9 +121,7 @@ def unpack_inference_batch(
     return images, filenames, labels
 
 
-# ============================================================
 # Embedding extraction
-# ============================================================
 
 @torch.no_grad()
 def encode_batch(
@@ -212,9 +207,7 @@ def extract_embeddings(
     return embeddings, filenames_out, labels_out
 
 
-# ============================================================
 # Saving / loading embeddings
-# ============================================================
 
 def save_embedding_file(
     path: str,
@@ -244,9 +237,7 @@ def load_embedding_file(
     )
 
 
-# ============================================================
 # Similarity search
-# ============================================================
 
 def compute_topk_indices(
     query_embeddings: torch.Tensor,
@@ -262,34 +253,45 @@ def compute_topk_indices(
 
         similarity = normalized_query @ normalized_gallery.T
 
-    Chunking avoids creating a huge matrix all at once.
+    Chunking avoids creating a huge matrix all at once. The requested ``top_k``
+    is clamped to the gallery size, so this function is safe on tiny validation
+    sets and will not crash when ``top_k > num_gallery``.
     """
+
+    if query_embeddings.ndim != 2 or gallery_embeddings.ndim != 2:
+        raise ValueError("query_embeddings and gallery_embeddings must be 2-D tensors")
+    if query_embeddings.size(0) == 0:
+        raise ValueError("query_embeddings is empty")
+    if gallery_embeddings.size(0) == 0:
+        raise ValueError("gallery_embeddings is empty")
+    if query_embeddings.size(1) != gallery_embeddings.size(1):
+        raise ValueError("query and gallery embeddings must have the same dimension")
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
 
     if device is None:
         device = get_device()
 
-    query_embeddings = F.normalize(query_embeddings, p=2, dim=1)
-    gallery_embeddings = F.normalize(gallery_embeddings, p=2, dim=1)
+    safe_top_k = min(int(top_k), gallery_embeddings.size(0))
 
-    gallery_embeddings = gallery_embeddings.to(device)
+    query_embeddings = F.normalize(query_embeddings.float(), p=2, dim=1)
+    gallery_embeddings = F.normalize(gallery_embeddings.float(), p=2, dim=1).to(device)
 
     all_topk_indices = []
 
     for start in range(0, query_embeddings.size(0), chunk_size):
         end = start + chunk_size
-
         query_chunk = query_embeddings[start:end].to(device)
-
         similarity = query_chunk @ gallery_embeddings.T
-
         _, topk_indices = torch.topk(
             similarity,
-            k=top_k,
+            k=safe_top_k,
             dim=1,
             largest=True,
             sorted=True,
         )
-
         all_topk_indices.append(topk_indices.cpu())
 
     return torch.cat(all_topk_indices, dim=0)
@@ -345,9 +347,7 @@ def save_results_json(
     print(f"Saved retrieval results to: {path}")
 
 
-# ============================================================
 # Full block 3 pipeline
-# ============================================================
 
 @torch.no_grad()
 def generate_query_gallery_embeddings(
@@ -476,9 +476,7 @@ def make_retrieval_results(
     return results
 
 
-# ============================================================
 # Optional: validation metrics using embeddings
-# ============================================================
 
 def compute_retrieval_metrics_from_embeddings(
     query_embeddings: torch.Tensor,

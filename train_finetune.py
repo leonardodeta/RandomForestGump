@@ -1,17 +1,27 @@
-# train_finetune.py
+"""
+train_finetune.py
+-----------------
+Optional supervised fine-tuning utilities.
+
+This file is not required for the main competition baseline. It is useful only
+when identity labels are available. The final retrieval pipeline can still run
+with the pretrained FaceNet encoder without using this module.
+"""
+
 
 import copy
+import random
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from loss_functions import ArcFaceLoss, CosFaceLoss, NormalizedSoftmaxLoss
 
-# ============================================================
 # Configuration
-# ============================================================
 
 @dataclass
 class FineTuneConfig:
@@ -29,6 +39,17 @@ class FineTuneConfig:
     weight_decay: float = 1e-4
     label_smoothing: float = 0.05
 
+    # Supervised objective. "cross_entropy" uses the model classifier head.
+    # The angular-margin alternatives are better aligned with cosine retrieval,
+    # but should still be validated before use.
+    supervised_loss: str = "cross_entropy"
+    margin: float = 0.35
+    scale: float = 30.0
+
+    # Reproducibility and checkpoint metadata
+    seed: int = 42
+    image_size: int = 160
+
     # Retrieval validation
     top_k: int = 10
     use_flip_tta: bool = True
@@ -44,14 +65,23 @@ class FineTuneConfig:
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
 
-# ============================================================
+
+def set_seed(seed: int = 42, deterministic: bool = False) -> None:
+    """Set common random seeds for reproducible training runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
 # Batch utilities
-# ============================================================
 
 def unpack_batch(batch, device: torch.device):
     """
@@ -94,9 +124,7 @@ def unpack_batch(batch, device: torch.device):
     return images, labels
 
 
-# ============================================================
 # Freezing strategy
-# ============================================================
 
 def freeze_backbone(model: nn.Module) -> None:
     """
@@ -107,6 +135,9 @@ def freeze_backbone(model: nn.Module) -> None:
 
     for param in model.backbone.parameters():
         param.requires_grad = False
+
+    if getattr(model, "classifier", None) is None:
+        raise ValueError("Supervised fine-tuning requires model.classifier to be defined.")
 
     for param in model.classifier.parameters():
         param.requires_grad = True
@@ -123,19 +154,26 @@ def unfreeze_last_layers(model: nn.Module) -> None:
     for param in model.backbone.parameters():
         param.requires_grad = False
 
-    trainable_keywords = [
-        "repeat_3",
-        "block8",
-        "last_linear",
-        "last_bn",
-    ]
-
-    for name, param in model.backbone.named_parameters():
-        if any(keyword in name for keyword in trainable_keywords):
+    if getattr(model, "arch", "inception_resnet_v1") == "inception_resnet_v1":
+        trainable_keywords = [
+            "repeat_3",
+            "block8",
+            "last_linear",
+            "last_bn",
+        ]
+        for name, param in model.backbone.named_parameters():
+            if any(keyword in name for keyword in trainable_keywords):
+                param.requires_grad = True
+    else:
+        # timm Inception-ResNet-V2 names can vary by version; unfreeze the
+        # final parameter tensors instead of relying on exact block names.
+        named_params = list(model.backbone.named_parameters())
+        for _, param in named_params[-30:]:
             param.requires_grad = True
 
-    for param in model.classifier.parameters():
-        param.requires_grad = True
+    if getattr(model, "classifier", None) is not None:
+        for param in model.classifier.parameters():
+            param.requires_grad = True
 
 
 def unfreeze_full_backbone(model: nn.Module) -> None:
@@ -151,16 +189,14 @@ def unfreeze_full_backbone(model: nn.Module) -> None:
 def count_trainable_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-
-# ============================================================
 # Optimizer
-# ============================================================
 
 def build_optimizer(
     model: nn.Module,
     classifier_lr: float,
     backbone_lr: float,
     weight_decay: float,
+    extra_modules: Optional[Iterable[nn.Module]] = None,
 ) -> torch.optim.Optimizer:
 
     backbone_params = [
@@ -168,10 +204,13 @@ def build_optimizer(
         if p.requires_grad
     ]
 
-    classifier_params = [
-        p for p in model.classifier.parameters()
-        if p.requires_grad
-    ]
+    if getattr(model, "classifier", None) is None:
+        classifier_params = []
+    else:
+        classifier_params = [
+            p for p in model.classifier.parameters()
+            if p.requires_grad
+        ]
 
     param_groups = []
 
@@ -187,15 +226,69 @@ def build_optimizer(
             "lr": classifier_lr,
         })
 
+    if extra_modules is not None:
+        extra_params = [
+            p
+            for module in extra_modules
+            for p in module.parameters()
+            if p.requires_grad
+        ]
+        if extra_params:
+            param_groups.append({
+                "params": extra_params,
+                "lr": classifier_lr,
+            })
+
+    if not param_groups:
+        raise ValueError(
+            "No trainable parameters found. Check the freezing strategy and classifier head."
+        )
+
     return torch.optim.AdamW(
         param_groups,
         weight_decay=weight_decay,
     )
 
+# Supervised objective
 
-# ============================================================
+def build_supervised_criterion(config: FineTuneConfig, embedding_dim: int) -> Optional[nn.Module]:
+    """Create an optional retrieval-oriented supervised loss.
+
+    ``None`` means ordinary cross entropy over the model classifier head.
+    The other options operate directly on embeddings and better match cosine
+    retrieval, but they should still be chosen only after validation.
+    """
+    name = config.supervised_loss.lower().replace("-", "_")
+    if name in {"cross_entropy", "ce"}:
+        return None
+    if name == "arcface":
+        return ArcFaceLoss(
+            num_classes=config.num_classes,
+            embedding_dim=embedding_dim,
+            scale=config.scale,
+            margin=config.margin,
+            label_smoothing=config.label_smoothing,
+        )
+    if name == "cosface":
+        return CosFaceLoss(
+            num_classes=config.num_classes,
+            embedding_dim=embedding_dim,
+            scale=config.scale,
+            margin=config.margin,
+            label_smoothing=config.label_smoothing,
+        )
+    if name in {"normalized_softmax", "norm_softmax"}:
+        return NormalizedSoftmaxLoss(
+            num_classes=config.num_classes,
+            embedding_dim=embedding_dim,
+            scale=config.scale,
+            label_smoothing=config.label_smoothing,
+        )
+    raise ValueError(
+        "Unsupported supervised_loss. Use cross_entropy, arcface, cosface, or normalized_softmax."
+    )
+
 # One training epoch
-# ============================================================
 
 def train_one_epoch(
     model: nn.Module,
@@ -204,6 +297,7 @@ def train_one_epoch(
     device: torch.device,
     label_smoothing: float = 0.05,
     log_every: int = 25,
+    criterion: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
 
     model.train()
@@ -218,13 +312,24 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         outputs = model(images)
-        logits = outputs["logits"]
-
-        loss = F.cross_entropy(
-            logits,
-            labels,
-            label_smoothing=label_smoothing,
-        )
+        if criterion is None:
+            if "logits" not in outputs:
+                raise ValueError("cross-entropy training requires a model with a classifier head.")
+            logits = outputs["logits"]
+            loss = F.cross_entropy(
+                logits,
+                labels,
+                label_smoothing=label_smoothing,
+            )
+        else:
+            raw_embeddings = outputs.get("raw_embeddings", outputs.get("embeddings"))
+            if raw_embeddings is None:
+                raise ValueError("metric-loss training requires model outputs to include embeddings")
+            loss_output = criterion(raw_embeddings, labels)
+            loss = loss_output["loss"]
+            logits = loss_output.get("logits", loss_output.get("cosine_logits"))
+            if logits is None:
+                raise ValueError("criterion output must include logits or cosine_logits for accuracy logging")
 
         loss.backward()
         optimizer.step()
@@ -252,10 +357,7 @@ def train_one_epoch(
         "classification_accuracy": total_correct / max(total_examples, 1),
     }
 
-
-# ============================================================
 # Classification validation
-# ============================================================
 
 @torch.no_grad()
 def evaluate_classifier(
@@ -274,6 +376,8 @@ def evaluate_classifier(
         images, labels = unpack_batch(batch, device)
 
         outputs = model(images)
+        if "logits" not in outputs:
+            raise ValueError("evaluate_classifier requires a model with a classifier head.")
         logits = outputs["logits"]
 
         loss = F.cross_entropy(logits, labels)
@@ -291,10 +395,7 @@ def evaluate_classifier(
         "classification_accuracy": total_correct / max(total_examples, 1),
     }
 
-
-# ============================================================
 # Embedding extraction for retrieval validation
-# ============================================================
 
 @torch.no_grad()
 def extract_embeddings_with_labels(
@@ -333,9 +434,7 @@ def extract_embeddings_with_labels(
     return all_embeddings, all_labels
 
 
-# ============================================================
 # Retrieval validation
-# ============================================================
 
 def compute_topk_retrieval_metrics(
     query_embeddings: torch.Tensor,
@@ -350,9 +449,13 @@ def compute_topk_retrieval_metrics(
 
     similarity_matrix = query_embeddings @ gallery_embeddings.T
 
+    if gallery_embeddings.size(0) == 0:
+        raise ValueError("gallery_embeddings is empty")
+    safe_top_k = min(int(top_k), gallery_embeddings.size(0))
+
     _, topk_indices = torch.topk(
         similarity_matrix,
-        k=top_k,
+        k=safe_top_k,
         dim=1,
         largest=True,
         sorted=True,
@@ -418,10 +521,7 @@ def evaluate_retrieval(
         top_k=top_k,
     )
 
-
-# ============================================================
 # Full fine-tuning procedure
-# ============================================================
 
 def fine_tune_face_model(
     model: nn.Module,
@@ -436,16 +536,21 @@ def fine_tune_face_model(
         device = get_device()
 
     print(f"Using device: {device}")
+    set_seed(config.seed)
 
     model = model.to(device)
+    criterion = build_supervised_criterion(config, getattr(model, "embedding_dim"))
+    if criterion is not None:
+        criterion = criterion.to(device)
+        print(f"Using supervised retrieval loss: {config.supervised_loss}")
+    else:
+        print("Using supervised loss: cross_entropy")
 
     best_state = copy.deepcopy(model.state_dict())
     best_score = float("-inf")
     epochs_without_improvement = 0
 
-    # --------------------------------------------------------
     # Helper: validate using retrieval, not only classification
-    # --------------------------------------------------------
 
     def run_retrieval_validation(stage_name: str, epoch: int) -> float:
         nonlocal best_state
@@ -481,9 +586,15 @@ def fine_tune_face_model(
 
             torch.save(
                 {
+                    "checkpoint_version": 2,
                     "model_state_dict": best_state,
                     "config": config,
+                    "arch": getattr(model, "arch", "inception_resnet_v1"),
+                    "num_classes": config.num_classes,
+                    "image_size": config.image_size,
                     "best_score": best_score,
+                    "training_mode": "supervised_finetune",
+                    "supervised_loss": config.supervised_loss,
                 },
                 config.checkpoint_path,
             )
@@ -499,9 +610,7 @@ def fine_tune_face_model(
 
         return score
 
-    # ========================================================
     # Stage 1: frozen backbone
-    # ========================================================
 
     print("\n==============================")
     print("Stage 1: frozen backbone")
@@ -516,6 +625,7 @@ def fine_tune_face_model(
         classifier_lr=config.classifier_lr,
         backbone_lr=config.backbone_lr,
         weight_decay=config.weight_decay,
+        extra_modules=[criterion] if criterion is not None else None,
     )
 
     for epoch in range(1, config.frozen_epochs + 1):
@@ -526,6 +636,7 @@ def fine_tune_face_model(
             device=device,
             label_smoothing=config.label_smoothing,
             log_every=config.log_every,
+            criterion=criterion,
         )
 
         print(
@@ -536,9 +647,7 @@ def fine_tune_face_model(
 
         run_retrieval_validation("Stage 1", epoch)
 
-    # ========================================================
     # Stage 2: partial fine-tuning
-    # ========================================================
 
     print("\n==============================")
     print("Stage 2: fine-tune last layers")
@@ -553,6 +662,7 @@ def fine_tune_face_model(
         classifier_lr=config.classifier_lr * 0.2,
         backbone_lr=config.backbone_lr,
         weight_decay=config.weight_decay,
+        extra_modules=[criterion] if criterion is not None else None,
     )
 
     epochs_without_improvement = 0
@@ -565,6 +675,7 @@ def fine_tune_face_model(
             device=device,
             label_smoothing=config.label_smoothing,
             log_every=config.log_every,
+            criterion=criterion,
         )
 
         print(
@@ -579,9 +690,7 @@ def fine_tune_face_model(
             print("Early stopping triggered.")
             break
 
-    # ========================================================
     # Load best model
-    # ========================================================
 
     if val_query_loader is not None and val_gallery_loader is not None:
         model.load_state_dict(best_state)
@@ -590,9 +699,7 @@ def fine_tune_face_model(
     return model
 
 
-# ============================================================
 # SimCLR: dataset a coppie e training epoch
-# ============================================================
 
 import os
 from typing import Tuple
@@ -633,11 +740,11 @@ def _simclr_augmentation(image_size: int = 160) -> transforms.Compose:
 
 class PairDataset(Dataset):
     """
-    Carica immagini da una cartella (piatta o ImageFolder).
-    Per ogni immagine restituisce due augmentazioni diverse: (view_a, view_b).
-    Le label non vengono usate.
+    Loads images from a folder (flat or ImageFolder).
+    Returns two different augmentations for each image: (view_a, view_b).
+    Labels are not used.
 
-    Compatibile con CelebA (cartella piatta) e qualsiasi struttura ImageFolder.
+    Compatible with CelebA (flat folder) and any ImageFolder structure.
     """
 
     VALID_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
@@ -675,21 +782,20 @@ def train_simclr_epoch(
     log_every: int = 50,
 ) -> Dict[str, float]:
     """
-    Un epoch di training SimCLR.
+    One epoch of self-supervised two-view training.
 
-    Args:
-        backbone:         FaceRetrievalModel (o qualsiasi modello con .encode())
-        projection_head:  ProjectionHead importato da face_retrieval_model
-        loader:           DataLoader che restituisce coppie (view_a, view_b)
-        optimizer:        ottimizzatore che copre sia backbone che head
-        criterion:        NTXentLoss da loss_functions
-        device:           device su cui girare
-        log_every:        ogni quanti step stampare il log
-
-    Returns:
-        dict con "loss" media dell'epoch
+    The criterion can be NTXentLoss or TripletLoss. When the backbone is fully
+    frozen we keep it in eval mode, otherwise BatchNorm running statistics would
+    still change even though all parameters have requires_grad=False.
     """
-    backbone.train()
+    backbone_has_trainable_params = any(
+        p.requires_grad for p in backbone.parameters()
+    )
+    if backbone_has_trainable_params:
+        backbone.train()
+    else:
+        backbone.eval()
+
     projection_head.train()
 
     total_loss = 0.0
@@ -701,12 +807,11 @@ def train_simclr_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Estrai embedding dal backbone, poi proietta
-        h_a = backbone.encode(view_a, normalize=False)   # (N, 512)
-        h_b = backbone.encode(view_b, normalize=False)   # (N, 512)
+        h_a = backbone.encode(view_a, normalize=False)
+        h_b = backbone.encode(view_b, normalize=False)
 
-        z_a = projection_head(h_a)                       # (N, 128)
-        z_b = projection_head(h_b)                       # (N, 128)
+        z_a = projection_head(h_a)
+        z_b = projection_head(h_b)
 
         loss_output = criterion(z_a, z_b)
         loss = loss_output["loss"]
@@ -719,6 +824,6 @@ def train_simclr_epoch(
 
         if log_every > 0 and step % log_every == 0:
             avg = total_loss / total_steps
-            print(f"  step {step:04d} | simclr loss {avg:.4f}")
+            print(f"  step {step:04d} | self-supervised loss {avg:.4f}")
 
     return {"loss": total_loss / max(total_steps, 1)}

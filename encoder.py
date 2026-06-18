@@ -1,13 +1,11 @@
 """
 encoder.py
 ----------
-Interfaccia astratta tra il MODELLO (che fa il compagno) e il SEARCH SYSTEM.
+Abstract interface between the MODEL — provided by the partner — and the SEARCH SYSTEM.
 
-Il compagno deve fornire una classe che eredita da `Encoder` e implementa
-`embed_batch`. Il search system non sa (e non deve sapere) cosa c'è dentro:
-puo' essere ResNet50 ImageNet, ResNet50 fine-tunato, ensemble, etc.
+The partner must provide a class that inherits from Encoder and implements embed_batch. The search system does not know, and must not know, what is inside: it could be ImageNet ResNet50, fine-tuned ResNet50, an ensemble, etc.
 
-Questo permette di sviluppare in parallelo senza pestarsi i piedi.
+This makes it possible to develop in parallel without getting in each other’s way.
 """
 
 from abc import ABC, abstractmethod
@@ -17,38 +15,32 @@ from PIL import Image
 
 
 class Encoder(ABC):
-    """Interfaccia che ogni modello deve rispettare."""
+    """Interface for every model."""
 
     @property
     @abstractmethod
     def embedding_dim(self) -> int:
-        """Dimensionalita' dell'embedding prodotto (es. 2048 per ResNet50)."""
+        """Dimensionality of the product embedding (eg. 2048 for ResNet50)."""
         ...
 
     @abstractmethod
     def embed_batch(self, images: List[Image.Image]) -> torch.Tensor:
         """
-        Estrae embedding da una lista di immagini PIL.
+        Extracts embeddings from a list of PIL images.
 
         Args:
-            images: lista di N immagini PIL
+        images: list of N PIL images
 
         Returns:
-            Tensor di shape (N, D) NON normalizzato.
-            La normalizzazione la fa il search system, cosi' siamo sicuri
-            che sia consistente in tutta la pipeline.
+        Shape tensor (N, D) NOT normalized.
+        The search system does the normalization, so we can be sure
+        it is consistent throughout the pipeline.
         """
         ...
 
 
-# ============================================================================
-# Implementazione di default: ResNet50 ImageNet (lo script di partenza).
-# Serve come BASELINE e come stand-in finche' il compagno non ha pronto
-# il modello fine-tunato.
-# ============================================================================
-
 class ResNet50ImageNetEncoder(Encoder):
-    """ResNet50 pretrainata su ImageNet, fc rimossa -> output 2048-d."""
+    """ResNet50 pretrained on Facenet, fc removed -> output 2048-d."""
 
     def __init__(self, device: torch.device):
         from torchvision.models import resnet50, ResNet50_Weights
@@ -71,16 +63,3 @@ class ResNet50ImageNetEncoder(Encoder):
             features = self.model(tensors)
         return features.cpu()
 
-
-# ============================================================================
-# Quando il compagno ha pronto il modello fine-tunato, creera' qualcosa tipo:
-#
-# class FinetunedResNet50Encoder(Encoder):
-#     def __init__(self, checkpoint_path, device):
-#         ...carica i pesi fine-tunati...
-#
-#     def embed_batch(self, images):
-#         ...stesso input/output, modello diverso dentro...
-#
-# Il search system non cambia di una riga.
-# ============================================================================

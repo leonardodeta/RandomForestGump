@@ -8,10 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ============================================================
 # Configuration
-# ============================================================
 
 @dataclass
 class LossConfig:
@@ -31,10 +28,7 @@ class LossConfig:
     # Supervised contrastive loss parameter
     temperature: float = 0.07
 
-
-# ============================================================
 # ArcFace loss
-# ============================================================
 
 class ArcFaceLoss(nn.Module):
     """
@@ -117,10 +111,7 @@ class ArcFaceLoss(nn.Module):
             "cosine_logits": cosine,
         }
 
-
-# ============================================================
 # CosFace loss
-# ============================================================
 
 class CosFaceLoss(nn.Module):
     """
@@ -180,10 +171,7 @@ class CosFaceLoss(nn.Module):
             "cosine_logits": cosine,
         }
 
-
-# ============================================================
 # Normalized softmax baseline
-# ============================================================
 
 class NormalizedSoftmaxLoss(nn.Module):
     """
@@ -236,10 +224,7 @@ class NormalizedSoftmaxLoss(nn.Module):
             "cosine_logits": logits / self.scale,
         }
 
-
-# ============================================================
 # Optional supervised contrastive loss
-# ============================================================
 
 class SupervisedContrastiveLoss(nn.Module):
     """
@@ -306,10 +291,7 @@ class SupervisedContrastiveLoss(nn.Module):
             "cosine_logits": similarity,
         }
 
-
-# ============================================================
 # Loss factory
-# ============================================================
 
 def build_loss_function(config: LossConfig) -> nn.Module:
     loss_name = config.loss_name.lower()
@@ -347,10 +329,7 @@ def build_loss_function(config: LossConfig) -> nn.Module:
 
     raise ValueError(f"Unknown loss name: {config.loss_name}")
 
-
-# ============================================================
 # Optimizer helper
-# ============================================================
 
 def build_optimizer_with_loss(
     model: nn.Module,
@@ -397,10 +376,7 @@ def build_optimizer_with_loss(
         weight_decay=weight_decay,
     )
 
-
-# ============================================================
 # Batch utility
-# ============================================================
 
 def unpack_training_batch(batch, device: torch.device):
     """
@@ -442,10 +418,7 @@ def unpack_training_batch(batch, device: torch.device):
 
     return images, labels
 
-
-# ============================================================
 # Training epoch using the chosen loss
-# ============================================================
 
 def train_one_epoch_with_identity_loss(
     model: nn.Module,
@@ -525,11 +498,7 @@ def train_one_epoch_with_identity_loss(
 
     return result
 
-
-# ============================================================
 # Validation using the chosen loss
-# ============================================================
-
 
 @torch.no_grad()
 def evaluate_identity_loss(
@@ -581,9 +550,7 @@ def evaluate_identity_loss(
     return result
 
 
-# ============================================================
-# NT-Xent loss (SimCLR) — non richiede label di identita'
-# ============================================================
+# NT-Xent loss (SimCLR)
 
 class NTXentLoss(nn.Module):
     """
@@ -636,10 +603,7 @@ class NTXentLoss(nn.Module):
         loss = F.cross_entropy(sim, labels)
         return {"loss": loss, "logits": None}
 
-
-# ============================================================
-# Triplet Loss con hard negative mining online
-# ============================================================
+# Triplet Loss 
 
 class TripletLoss(nn.Module):
     """

@@ -1,18 +1,34 @@
 """
 reranking.py
 ------------
-Re-ranking degli embedding gia' estratti.
+Post-processing utilities for already-extracted face embeddings.
 
-Implementa:
-1. k-reciprocal re-ranking (Zhong et al., CVPR 2017)
-2. Query Expansion (alpha-QE)
+Implemented methods:
+1. k-reciprocal re-ranking (Zhong et al., CVPR 2017), adapted for cosine
+   distances on L2-normalized embeddings.
+2. Alpha Query Expansion.
 
-Entrambi lavorano SOLO sugli embedding: non sanno nulla del modello
-sottostante. Questo li rende riutilizzabili e testabili in isolamento.
+The functions are independent from FaceNet and are safe on small galleries:
+parameters are validated and clamped where appropriate.
 """
 
-import torch
+from __future__ import annotations
+
 import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+_EPS = 1e-12
+
+
+def _validate_feature_matrix(name: str, value: torch.Tensor) -> None:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if value.ndim != 2:
+        raise ValueError(f"{name} must have shape (num_images, embedding_dim)")
+    if value.size(0) == 0:
+        raise ValueError(f"{name} must contain at least one embedding")
 
 
 def k_reciprocal_rerank(
@@ -21,113 +37,118 @@ def k_reciprocal_rerank(
     k1: int = 20,
     k2: int = 6,
     lambda_value: float = 0.3,
+    max_matrix_elements: int = 50_000_000,
 ) -> torch.Tensor:
+    """Apply k-reciprocal re-ranking.
+
+    The method builds a dense ``(num_query + num_gallery)^2`` matrix. The
+    ``max_matrix_elements`` guard prevents accidentally exhausting memory on a
+    large hidden set. Disable the guard only if you know the machine has enough
+    RAM.
     """
-    k-reciprocal re-ranking.
+    _validate_feature_matrix("query_feats", query_feats)
+    _validate_feature_matrix("gallery_feats", gallery_feats)
+    if query_feats.size(1) != gallery_feats.size(1):
+        raise ValueError("query_feats and gallery_feats must have the same embedding dimension")
+    if not (0.0 <= lambda_value <= 1.0):
+        raise ValueError("lambda_value must be in [0, 1]")
+    if k1 < 1:
+        raise ValueError("k1 must be >= 1")
+    if k2 < 1:
+        raise ValueError("k2 must be >= 1")
+    if max_matrix_elements < 1:
+        raise ValueError("max_matrix_elements must be >= 1")
 
-    Idea: due immagini A e B sono *davvero* simili se A e' nei top-k vicini
-    di B E B e' nei top-k vicini di A. Si calcola una distanza di Jaccard
-    sui set di k-vicini reciproci e la si combina con la cosine originale.
+    output_device = query_feats.device
 
-    Args:
-        query_feats: (M, D) embedding query L2-normalizzati
-        gallery_feats: (N, D) embedding gallery L2-normalizzati
-        k1: numero di vicini per costruire l'insieme k-reciproco (tipico 20)
-        k2: numero di vicini per la query expansion locale (tipico 6)
-        lambda_value: peso della distanza originale vs Jaccard.
-                      0 = solo Jaccard, 1 = solo cosine. Tipico 0.3.
+    query_np = F.normalize(query_feats.detach().cpu().float(), p=2, dim=1).numpy().astype(np.float32)
+    gallery_np = F.normalize(gallery_feats.detach().cpu().float(), p=2, dim=1).numpy().astype(np.float32)
 
-    Returns:
-        Matrice di distanze finali (M, N). Valori PICCOLI = match migliore.
-        (Attenzione: e' distanza, non similarita'. Per ottenere ranking:
-        usare torch.topk con largest=False, oppure -final_dist con largest=True.)
-    """
-    # Lavoriamo in numpy per coerenza con l'implementazione di riferimento
-    # di Zhong et al. che e' lo standard nel re-ID.
-    query_feats = query_feats.cpu().numpy().astype(np.float32)
-    gallery_feats = gallery_feats.cpu().numpy().astype(np.float32)
+    num_queries = query_np.shape[0]
+    num_gallery = gallery_np.shape[0]
+    total = num_queries + num_gallery
+    matrix_elements = total * total
+    if matrix_elements > max_matrix_elements:
+        raise MemoryError(
+            "k-reciprocal re-ranking would allocate a dense "
+            f"{total}x{total} matrix ({matrix_elements:,} elements), above the "
+            f"configured guard of {max_matrix_elements:,}. Use cosine ranking, "
+            "reduce the validation set, or increase --max-kreciprocal-matrix-elements."
+        )
 
-    M = query_feats.shape[0]
-    N = gallery_feats.shape[0]
+    all_feats = np.concatenate([query_np, gallery_np], axis=0)
 
-    # Concateno query e gallery in un unico insieme: serve calcolare le
-    # distanze reciproche tra TUTTI gli elementi (query incluse).
-    all_feats = np.concatenate([query_feats, gallery_feats], axis=0)
-    total = M + N
+    # The +1 convention below includes the item itself among nearest neighbours.
+    k1 = min(int(k1), max(total - 1, 1))
+    k2 = min(int(k2), total)
 
-    # Distanza coseno = 1 - similarita coseno (feature gia' normalizzate).
     original_dist = 1.0 - all_feats @ all_feats.T
-    original_dist = np.clip(original_dist, 0.0, 2.0)
+    original_dist = np.clip(original_dist, 0.0, 2.0).astype(np.float32)
 
-    # Normalizzo ogni colonna in [0,1] (passo standard di Zhong et al.).
-    original_dist = original_dist / np.max(original_dist, axis=0, keepdims=True)
+    denom = np.max(original_dist, axis=0, keepdims=True)
+    original_dist = original_dist / np.maximum(denom, _EPS)
+    original_dist = np.nan_to_num(original_dist, nan=0.0, posinf=1.0, neginf=0.0)
 
-    # === Costruzione dell'insieme k-reciproco esteso per ciascun elemento ===
-    V = np.zeros((total, total), dtype=np.float32)
     initial_rank = np.argsort(original_dist, axis=1)
+    V = np.zeros((total, total), dtype=np.float32)
 
     for i in range(total):
-        # Top k1+1 vicini di i (escludendo se stesso lo daremo per scontato)
         forward_k_neigh = initial_rank[i, : k1 + 1]
-        # Backward: per ogni j tra i forward, controllo che i sia nei suoi top-k1
         backward_k_neigh = initial_rank[forward_k_neigh, : k1 + 1]
-        fi = np.where(backward_k_neigh == i)[0]
-        k_reciprocal_index = forward_k_neigh[fi]
+        reciprocal_positions = np.where(backward_k_neigh == i)[0]
+        k_reciprocal_index = forward_k_neigh[reciprocal_positions]
 
-        # Estensione: aggiungi vicini "quasi reciproci" (vedi paper).
+        if k_reciprocal_index.size == 0:
+            k_reciprocal_index = np.array([i], dtype=np.int64)
+
         k_reciprocal_expansion = k_reciprocal_index.copy()
+        half_k1 = max(1, int(np.around(k1 / 2.0)))
+
         for candidate in k_reciprocal_index:
-            half_k1 = int(np.around(k1 / 2.0))
             cand_forward = initial_rank[candidate, : half_k1 + 1]
             cand_backward = initial_rank[cand_forward, : half_k1 + 1]
-            fi_cand = np.where(cand_backward == candidate)[0]
-            cand_reciprocal = cand_forward[fi_cand]
-            # Aggiungi se intersezione abbastanza grande
-            if (
-                len(np.intersect1d(cand_reciprocal, k_reciprocal_index))
-                > 2.0 / 3.0 * len(cand_reciprocal)
-            ):
-                k_reciprocal_expansion = np.append(
-                    k_reciprocal_expansion, cand_reciprocal
-                )
+            cand_positions = np.where(cand_backward == candidate)[0]
+            cand_reciprocal = cand_forward[cand_positions]
+            if cand_reciprocal.size == 0:
+                continue
+            overlap = len(np.intersect1d(cand_reciprocal, k_reciprocal_index))
+            if overlap > (2.0 / 3.0) * len(cand_reciprocal):
+                k_reciprocal_expansion = np.append(k_reciprocal_expansion, cand_reciprocal)
 
         k_reciprocal_expansion = np.unique(k_reciprocal_expansion)
+        weights = np.exp(-original_dist[i, k_reciprocal_expansion]).astype(np.float32)
+        weight_sum = float(weights.sum())
+        if weight_sum <= _EPS or not np.isfinite(weight_sum):
+            V[i, i] = 1.0
+        else:
+            V[i, k_reciprocal_expansion] = weights / weight_sum
 
-        # Pesi gaussiani sulla distanza originale
-        weight = np.exp(-original_dist[i, k_reciprocal_expansion])
-        V[i, k_reciprocal_expansion] = weight / np.sum(weight)
-
-    # === Local query expansion: media i vettori V dei top-k2 ===
     if k2 > 1:
         V_qe = np.zeros_like(V)
         for i in range(total):
             V_qe[i] = np.mean(V[initial_rank[i, :k2], :], axis=0)
         V = V_qe
 
-    # === Distanza di Jaccard tra i set k-reciproci ===
-    invIndex = [np.where(V[:, i] != 0)[0] for i in range(total)]
-    jaccard_dist = np.zeros((M, total), dtype=np.float32)
+    inv_index = [np.where(V[:, i] != 0)[0] for i in range(total)]
+    jaccard_dist = np.zeros((num_queries, total), dtype=np.float32)
 
-    for i in range(M):
+    for i in range(num_queries):
         temp_min = np.zeros(total, dtype=np.float32)
-        indNonZero = np.where(V[i, :] != 0)[0]
-        indImages = [invIndex[ind] for ind in indNonZero]
-        for j in range(len(indNonZero)):
-            temp_min[indImages[j]] += np.minimum(
-                V[i, indNonZero[j]], V[indImages[j], indNonZero[j]]
-            )
-        jaccard_dist[i] = 1.0 - temp_min / (2.0 - temp_min)
+        non_zero = np.where(V[i, :] != 0)[0]
+        for ind in non_zero:
+            related_images = inv_index[ind]
+            temp_min[related_images] += np.minimum(V[i, ind], V[related_images, ind])
+        jaccard_dist[i] = 1.0 - temp_min / np.maximum(2.0 - temp_min, _EPS)
 
-    # === Combinazione finale ===
     final_dist = (
         jaccard_dist * (1.0 - lambda_value)
-        + original_dist[:M, :] * lambda_value
+        + original_dist[:num_queries, :] * lambda_value
     )
-    # Restituisco solo le distanze query -> gallery
-    final_dist = final_dist[:, M:]
+    final_dist = final_dist[:, num_queries:]
     final_dist = np.clip(final_dist, 0.0, None)
+    final_dist = np.nan_to_num(final_dist, nan=0.0, posinf=2.0, neginf=0.0)
 
-    return torch.from_numpy(final_dist)
+    return torch.from_numpy(final_dist).to(output_device)
 
 
 def alpha_query_expansion(
@@ -136,33 +157,28 @@ def alpha_query_expansion(
     top_k: int = 5,
     alpha: float = 3.0,
 ) -> torch.Tensor:
-    """
-    Alpha Query Expansion (Radenovic et al., 2018).
+    """Apply alpha query expansion to query embeddings."""
+    _validate_feature_matrix("query_feats", query_feats)
+    _validate_feature_matrix("gallery_feats", gallery_feats)
+    if query_feats.size(1) != gallery_feats.size(1):
+        raise ValueError("query_feats and gallery_feats must have the same embedding dimension")
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1")
+    if alpha < 0:
+        raise ValueError("alpha must be non-negative")
 
-    Per ogni query, calcola un nuovo embedding come media pesata della query
-    stessa e dei suoi top-k match in gallery, con pesi sim^alpha.
-    Poi ri-normalizza. Le query "si arricchiscono" delle loro match migliori.
+    query_feats = F.normalize(query_feats.float(), p=2, dim=1)
+    gallery_feats = F.normalize(gallery_feats.float(), p=2, dim=1)
 
-    Args:
-        query_feats: (M, D) L2-normalizzati
-        gallery_feats: (N, D) L2-normalizzati
-        top_k: quanti gallery usare per espandere ogni query
-        alpha: esponente dei pesi (piu' alto = piu' selettivo)
+    safe_top_k = min(int(top_k), gallery_feats.size(0))
+    sim = query_feats @ gallery_feats.T
+    top_sims, top_idx = torch.topk(sim, k=safe_top_k, dim=1)
 
-    Returns:
-        (M, D) query expanded, L2-normalizzate.
-    """
-    sim = query_feats @ gallery_feats.T            # (M, N)
-    top_sims, top_idx = torch.topk(sim, k=top_k, dim=1)  # (M, k)
+    weights = torch.clamp(top_sims, min=0.0) ** alpha
+    weight_sums = weights.sum(dim=1, keepdim=True)
 
-    # Pesi: sim^alpha (con sim clampato >= 0 per evitare segni assurdi)
-    weights = torch.clamp(top_sims, min=0.0) ** alpha    # (M, k)
-    weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-12)
+    uniform = torch.full_like(weights, 1.0 / safe_top_k)
+    weights = torch.where(weight_sums > _EPS, weights / (weight_sums + _EPS), uniform)
 
-    # Embedding gallery dei top-k per ciascuna query
     expanded = (weights.unsqueeze(-1) * gallery_feats[top_idx]).sum(dim=1)
-
-    # Combina query originale + espansione, poi normalizza
-    new_query = query_feats + expanded
-    new_query = torch.nn.functional.normalize(new_query, p=2, dim=1)
-    return new_query
+    return F.normalize(query_feats + expanded, p=2, dim=1)

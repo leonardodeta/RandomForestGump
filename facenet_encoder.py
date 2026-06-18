@@ -1,52 +1,28 @@
 """
 facenet_encoder.py
 ------------------
-Implementazione di Encoder basata su FaceRetrievalModel (face_retrieval_model.py).
+Encoder implementation based on FaceRetrievalModel.
 
-Due modalita' di utilizzo:
-
-1. Pretrained puro (baseline forte, nessun training necessario):
-       encoder = FaceNetEncoder(device)
-
-2. Fine-tunato con SimCLR (dopo aver eseguito simclr_train.py):
-       encoder = FaceNetEncoder(device, checkpoint_path="simclr_checkpoint.pt")
-
-Il search system (search_system.py) non cambia in nessuno dei due casi.
+If a checkpoint is provided, the checkpoint metadata is used to restore both the
+architecture and the input image size. This avoids silently resizing inference
+images differently from the training run that produced the checkpoint.
 """
+
+from __future__ import annotations
 
 from typing import List, Optional
 
 import torch
 from PIL import Image
-from torchvision import transforms
 
 from encoder import Encoder
-from face_retrieval_model import FaceRetrievalModel, load_checkpoint, get_face_transform
+from face_retrieval_model import FaceRetrievalModel, get_face_transform, load_checkpoint
 
 
 class FaceNetEncoder(Encoder):
-    """
-    Feature extractor basato su FaceRetrievalModel.
-
-    arch='inception_resnet_v1' (default): InceptionResNetV1 pretrained VGGFace2, 512-d, image 160px.
-    arch='inception_resnet_v2':           InceptionResNetV2 via timm, ImageNet, 1536-d, image 299px.
-
-    Args:
-        device:          torch.device su cui girare il modello.
-        checkpoint_path: path al checkpoint salvato da simclr_train.py.
-                         Se None, usa i pesi pretrained.
-        image_size:      lato dell'immagine in input. Se None, usa il default dell'arch.
-        arch:            architettura da usare ('inception_resnet_v1' o 'inception_resnet_v2').
-    """
-
     _DEFAULT_IMAGE_SIZE = {
         "inception_resnet_v1": 160,
         "inception_resnet_v2": 299,
-    }
-
-    _EMBEDDING_DIM = {
-        "inception_resnet_v1": 512,
-        "inception_resnet_v2": 1536,
     }
 
     def __init__(
@@ -57,31 +33,61 @@ class FaceNetEncoder(Encoder):
         arch: str = "inception_resnet_v1",
     ):
         self.device = device
-        self.arch = arch
-        self._emb_dim = self._EMBEDDING_DIM[arch]
 
-        img_size = image_size or self._DEFAULT_IMAGE_SIZE[arch]
-        self.transform = get_face_transform(img_size)
-
+        checkpoint_image_size = None
         if checkpoint_path is not None:
-            model, config, _ = load_checkpoint(checkpoint_path, device)
-            print(f"[FaceNetEncoder] Caricato checkpoint da: {checkpoint_path}")
-        else:
-            model = FaceRetrievalModel(num_classes=None, pretrained="vggface2", arch=arch)
-            model = model.to(device)
-            print(f"[FaceNetEncoder] Usando pesi pretrained ({arch}).")
+            # Read lightweight metadata before constructing the model. We still
+            # call load_checkpoint for the actual model restoration.
+            metadata = torch.load(checkpoint_path, map_location="cpu")
+            config = metadata.get("config", None)
+            checkpoint_image_size = metadata.get("image_size", None) or getattr(config, "image_size", None)
 
+            model, _, _ = load_checkpoint(checkpoint_path, device)
+            resolved_arch = model.arch
+            if arch != resolved_arch:
+                print(
+                    f"[FaceNetEncoder] Checkpoint architecture is {resolved_arch}; "
+                    f"ignoring requested arch={arch}."
+                )
+            print(f"[FaceNetEncoder] Loaded checkpoint from: {checkpoint_path}")
+        else:
+            resolved_arch = arch
+            model = FaceRetrievalModel(
+                num_classes=None,
+                pretrained="vggface2" if resolved_arch == "inception_resnet_v1" else "imagenet",
+                arch=resolved_arch,
+            ).to(device)
+            print(f"[FaceNetEncoder] Using pretrained weights ({resolved_arch}).")
+
+        if resolved_arch not in self._DEFAULT_IMAGE_SIZE:
+            raise ValueError(f"Unsupported architecture: {resolved_arch}")
+
+        if image_size is not None:
+            resolved_image_size = int(image_size)
+        elif checkpoint_image_size is not None:
+            resolved_image_size = int(checkpoint_image_size)
+        else:
+            resolved_image_size = self._DEFAULT_IMAGE_SIZE[resolved_arch]
+
+        if resolved_image_size <= 0:
+            raise ValueError("image_size must be positive")
+
+        self.arch = resolved_arch
+        self._emb_dim = model.embedding_dim
+        self.image_size = resolved_image_size
+        self.transform = get_face_transform(self.image_size)
         self.model = model.eval()
+
+        print(f"[FaceNetEncoder] image_size = {self.image_size}")
 
     @property
     def embedding_dim(self) -> int:
         return self._emb_dim
 
     def embed_batch(self, images: List[Image.Image]) -> torch.Tensor:
-        """
-        Riceve una lista di immagini PIL, restituisce Tensor (N, embedding_dim).
-        NON normalizzato: ci pensa RetrievalSystem.
-        """
+        if not images:
+            return torch.empty((0, self.embedding_dim), dtype=torch.float32)
+
         tensors = torch.stack([
             self.transform(img.convert("RGB")) for img in images
         ]).to(self.device)
